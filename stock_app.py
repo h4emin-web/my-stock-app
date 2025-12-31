@@ -25,7 +25,7 @@ def format_korean_unit(val):
     if val >= 1000000000000: return f"{int(val // 1000000000000)}조"
     return f"{int(val // 100000000):,}억"
 
-# --- 암호화폐 데이터 (업비트) ---
+# --- 암호화폐 데이터 ---
 @st.cache_data(ttl=30)
 def get_crypto_data():
     try:
@@ -36,49 +36,55 @@ def get_crypto_data():
         t_data = requests.get(t_url, timeout=5).json()
         res = []
         for d in t_data:
-            res.append({
-                '코인명': krw_markets[d['market']],
-                '현재가': d['trade_price'],
-                '전일대비': d['signed_change_rate'] * 100,
-                '거래대금': d['acc_trade_price_24h']
-            })
+            res.append({'코인명': krw_markets[d['market']], '현재가': d['trade_price'], '전일대비': d['signed_change_rate'] * 100, '거래대금': d['acc_trade_price_24h']})
         df = pd.DataFrame(res).sort_values(by='거래대금', ascending=False).head(20)
         df.insert(0, 'No', range(1, len(df) + 1))
         return df
     except: return pd.DataFrame()
 
-# --- 주식 데이터 및 분석 로직 (로딩 보정 강화) ---
+# --- 주식 데이터 및 분석 로직 ---
 @st.cache_data(ttl=600, show_spinner=False)
 def get_data(mode, date_s, market):
     try:
-        # 1. 오늘 날짜 데이터 시도
         df_today = stock.get_market_ohlcv_by_ticker(date_s, market=market)
-        
-        # 만약 오늘 데이터가 비어있다면(휴장일 등), 가장 최근 영업일로 자동 변경
         if df_today.empty:
-            last_date = stock.get_nearest_business_day_in_a_week()
-            df_today = stock.get_market_ohlcv_by_ticker(last_date, market=market)
-            date_s = last_date
+            date_s = stock.get_nearest_business_day_in_a_week()
+            df_today = stock.get_market_ohlcv_by_ticker(date_s, market=market)
         
         df_cap = stock.get_market_cap_by_ticker(date_s, market=market)
-        
-        # 패턴 분석을 위한 과거 영업일 리스트
         start_search = (datetime.strptime(date_s, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
         ohlcv_sample = stock.get_market_ohlcv_by_date(start_search, date_s, "005930")
         days = ohlcv_sample.index.strftime("%Y%m%d").tolist()
-        
-        if mode == "역헤드앤숄더":
-            df_top = df_today.sort_values(by='거래대금', ascending=False).head(100)
+
+        if mode == "고가놀이":
+            # 요청 조건: 기준봉(4일 전 500억+15%상승) 이후 3일간 평균 등락률 5% 이하
+            if len(days) < 4: return pd.DataFrame()
+            
+            # 1. 4거래일 전 데이터에서 기준봉 후보 탐색
+            base_date = days[-4]
+            df_base = stock.get_market_ohlcv_by_ticker(base_date, market=market)
+            # 조건: 거래대금 500억 이상 AND 등락률 15% 이상
+            targets = df_base[(df_base['거래대금'] >= 50000000000) & (df_base['등락률'] >= 15)].index
+            
             res = []
-            for t in df_top.index:
+            for t in targets:
                 try:
-                    df_hist = stock.get_market_ohlcv_by_date(days[-30], date_s, t)['종가']
-                    if len(df_hist) < 25: continue
-                    p1, p2, p3 = df_hist[:10], df_hist[10:20], df_hist[20:]
-                    l1, l2, l3 = p1.min(), p2.min(), p3.min()
-                    if l2 < l1 and l2 < l3:
-                        if l3 <= df_hist.iloc[-1] <= l3 * 1.07:
-                            res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
+                    # 2. 이후 3일간(오늘 포함)의 등락률 합산 및 평균 계산
+                    recent_rates = []
+                    for d in days[-3:]: # 최근 3일간
+                        df_d = stock.get_market_ohlcv_by_ticker(d, market=market)
+                        recent_rates.append(df_d.loc[t, '등락률'])
+                    
+                    avg_rate = sum(recent_rates) / 3
+                    
+                    # 3. 평균 등락률이 5% 이하(절대값 기준 횡보)인 종목 선정
+                    if abs(avg_rate) <= 5:
+                        res.append({
+                            '기업명': stock.get_market_ticker_name(t),
+                            '시총_v': df_cap.loc[t, '시가총액'],
+                            '등락률': df_today.loc[t, '등락률'], # 오늘의 등락률 표시
+                            '대금_v': df_today.loc[t, '거래대금']
+                        })
                 except: continue
             return pd.DataFrame(res)
 
@@ -97,17 +103,17 @@ def get_data(mode, date_s, market):
             res = [{'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': stats_df.loc[t, '등락률']/n, '대금_v': stats_df.loc[t, '거래대금']/n} for t in valid_tickers]
             return pd.DataFrame(res)
 
-        elif mode == "고가놀이":
-            if len(days) < 6: return pd.DataFrame()
+        elif mode == "역헤드앤숄더":
+            df_top = df_today.sort_values(by='거래대금', ascending=False).head(100)
             res = []
-            top_tickers = df_today.sort_values(by='거래대금', ascending=False).head(200).index
-            for t in top_tickers:
+            for t in df_top.index:
                 try:
-                    hist = stock.get_market_ohlcv_by_date(days[-6], date_s, t)
-                    main_candle = hist.iloc[:-1][(hist.iloc[:-1]['등락률'] >= 15) & (hist.iloc[:-1]['거래대금'] >= 50000000000)]
-                    if not main_candle.empty:
-                        base_p = main_candle.iloc[-1]['종가']
-                        if base_p * 0.93 <= df_today.loc[t, '종가'] <= base_p * 1.10:
+                    df_hist = stock.get_market_ohlcv_by_date(days[-30], date_s, t)['종가']
+                    if len(df_hist) < 25: continue
+                    p1, p2, p3 = df_hist[:10], df_hist[10:20], df_hist[20:]
+                    l1, l2, l3 = p1.min(), p2.min(), p3.min()
+                    if l2 < l1 and l2 < l3:
+                        if l3 <= df_hist.iloc[-1] <= l3 * 1.07:
                             res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
                 except: continue
             return pd.DataFrame(res)
@@ -122,13 +128,11 @@ def get_data(mode, date_s, market):
             df = df_today.sort_values(by='거래대금', ascending=False).head(50)
             res = [{'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df.loc[t, '등락률'], '대금_v': df.loc[t, '거래대금']} for t in df.index]
             return pd.DataFrame(res)
-    except Exception as e:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 # --- 앱 메인 UI ---
 st.title("해민증권🧑‍💼")
 
-# 가장 최근 영업일 기본값 설정
 try:
     init_date_str = stock.get_nearest_business_day_in_a_week()
     default_d = datetime.strptime(init_date_str, "%Y%m%d")
@@ -157,7 +161,7 @@ else:
         with tab:
             data = get_data(mode, date_s, mkt)
             if data is None or data.empty:
-                st.info("데이터가 없거나 분석 조건에 맞는 종목이 없습니다.")
+                st.info("조건에 맞는 종목이 없습니다.")
             else:
                 data = data.sort_values(by='대금_v', ascending=False)
                 data.insert(0, 'No', range(1, len(data) + 1))
