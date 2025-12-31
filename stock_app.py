@@ -22,22 +22,31 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- 외부 데이터 함수 ---
-def get_upbit_coins():
+@st.cache_data(ttl=10) # 코인 시세는 더 자주 갱신되도록 설정
+def get_crypto_data():
     try:
-        # 업비트 주요 코인 (KRW 마켓)
-        target_markets = "KRW-BTC,KRW-ETH,KRW-XRP,KRW-SOL,KRW-DOGE,KRW-ADA,KRW-STX,KRW-AVAX"
-        url = f"https://api.upbit.com/v1/ticker?markets={target_markets}"
-        data = requests.get(url).json()
+        # 업비트 마켓 리스트 조회 (한글명 매칭용)
+        m_url = "https://api.upbit.com/v1/market/all"
+        m_data = requests.get(m_url).json()
+        name_dict = {d['market']: d['korean_name'] for d in m_data if d['market'].startswith("KRW-")}
+        
+        # 주요 코인 티커 조회
+        target_markets = ",".join(list(name_dict.keys())[:15]) # 상위 15개 예시 (조절 가능)
+        t_url = f"https://api.upbit.com/v1/ticker?markets={target_markets}"
+        t_data = requests.get(t_url).json()
         
         res = []
-        for d in data:
+        for d in t_data:
             res.append({
-                '기업명': d['market'].replace("KRW-", ""),
-                '시총_v': 0, 
-                '등락률': d['signed_change_rate'] * 100,
-                '대금_v': d['acc_trade_price_24h']
+                '코인명': name_dict.get(d['market'], d['market']),
+                '현재가': d['trade_price'],
+                '전일대비': d['signed_change_rate'] * 100,
+                '거래대금': d['acc_trade_price_24h']
             })
-        return pd.DataFrame(res).sort_values(by='대금_v', ascending=False)
+        # 거래대금 순으로 정렬
+        df = pd.DataFrame(res).sort_values(by='거래대금', ascending=False)
+        df.insert(0, 'No', range(1, len(df) + 1))
+        return df
     except: return pd.DataFrame()
 
 # --- 유틸리티 함수 ---
@@ -46,11 +55,8 @@ def format_korean_unit(val):
     if val >= 1000000000000: return f"{int(val // 1000000000000)}조"
     return f"{int(val // 100000000):,}억"
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_data(mode, date_s, market):
-    if mode == "업비트 코인":
-        return get_upbit_coins()
-        
     try:
         start_search = (datetime.strptime(date_s, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
         ohlcv_sample = stock.get_market_ohlcv_by_date(start_search, date_s, "005930")
@@ -125,31 +131,50 @@ with col1:
     date_s = d_input.strftime("%Y%m%d")
 with col2:
     mode = st.selectbox("분석 모드", [
-        "거래대금 상위", "3일 연속 거래대금", "5일 연속 거래대금", "상한가", "하한가", "고가놀이", "역헤드앤숄더", "업비트 코인"
+        "거래대금 상위", "3일 연속 거래대금", "5일 연속 거래대금", "상한가", "하한가", "고가놀이", "역헤드앤숄더", "암호화폐"
     ])
 
 st.divider()
 
-t1, t2 = st.tabs(["KOSPI", "KOSDAQ"])
-
-for tab, mkt in zip([t1, t2], ["KOSPI", "KOSDAQ"]):
-    with tab:
-        with st.spinner("데이터 불러오는 중..."):
-            data = get_data(mode, date_s, mkt)
+if mode == "암호화폐":
+    # 암호화폐 모드일 때는 탭 구분 없이 단일 표 출력
+    with st.spinner("코인 시세 불러오는 중..."):
+        c_data = get_crypto_data()
+    
+    if c_data.empty:
+        st.info("시세를 불러올 수 없습니다.")
+    else:
+        # 천단위 콤마 및 억 단위 포맷팅
+        c_data['현재가'] = c_data['현재가'].apply(lambda x: f"{x:,.0f}" if x >= 100 else f"{x:,.2f}")
+        c_data['거래대금'] = c_data['거래대금'].apply(format_korean_unit)
         
-        if data.empty:
-            st.info("조건에 맞는 데이터가 없습니다.")
-        else:
-            data.insert(0, 'No', range(1, len(data) + 1))
-            data['시총'] = data['시총_v'].apply(format_korean_unit)
-            data['대금'] = data['대금_v'].apply(format_korean_unit)
+        st.dataframe(
+            c_data.style.map(
+                lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=['전일대비']
+            ).format({'전일대비': '{:.1f}%'}),
+            use_container_width=True, height=700, hide_index=True
+        )
+else:
+    # 기존 주식 분석 모드 (KOSPI/KOSDAQ 탭 유지)
+    t1, t2 = st.tabs(["KOSPI", "KOSDAQ"])
+    for tab, mkt in zip([t1, t2], ["KOSPI", "KOSDAQ"]):
+        with tab:
+            with st.spinner("데이터 분석 중..."):
+                data = get_data(mode, date_s, mkt)
             
-            l_rate = "평균등락" if "연속" in mode else "등락률"
-            l_amt = "24h거래대금" if mode == "업비트 코인" else ("평균대금" if "연속" in mode else "거래대금")
-            
-            st.dataframe(
-                data[['No', '기업명', '시총', '등락률', '대금']].rename(columns={'등락률': l_rate, '대금': l_amt}).style.map(
-                    lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=[l_rate]
-                ).format({l_rate: '{:.1f}%'}),
-                use_container_width=True, height=600, hide_index=True
-            )
+            if data.empty:
+                st.info("조건에 맞는 데이터가 없습니다.")
+            else:
+                data.insert(0, 'No', range(1, len(data) + 1))
+                data['시총'] = data['시총_v'].apply(format_korean_unit)
+                data['대금'] = data['대금_v'].apply(format_korean_unit)
+                
+                l_rate = "평균등락" if "연속" in mode else "등락률"
+                l_amt = "평균대금" if "연속" in mode else "거래대금"
+                
+                st.dataframe(
+                    data[['No', '기업명', '시총', '등락률', '대금']].rename(columns={'등락률': l_rate, '대금': l_amt}).style.map(
+                        lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=[l_rate]
+                    ).format({l_rate: '{:.1f}%'}),
+                    use_container_width=True, height=600, hide_index=True
+                )
