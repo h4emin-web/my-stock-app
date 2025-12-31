@@ -56,51 +56,54 @@ def get_data(mode, date_s, market):
         ohlcv_sample = stock.get_market_ohlcv_by_date(start_search, date_s, "005930")
         days = ohlcv_sample.index.strftime("%Y%m%d").tolist()
 
-        if mode == "고가놀이":
-            # 요청 조건: 기준봉(4일 전 500억+15%상승) 이후 3일간 평균 등락률 5% 이하
-            if len(days) < 4: return pd.DataFrame()
-            
-            # 1. 4거래일 전 데이터에서 기준봉 후보 탐색
-            base_date = days[-4]
-            df_base = stock.get_market_ohlcv_by_ticker(base_date, market=market)
-            # 조건: 거래대금 500억 이상 AND 등락률 15% 이상
-            targets = df_base[(df_base['거래대금'] >= 50000000000) & (df_base['등락률'] >= 15)].index
-            
-            res = []
-            for t in targets:
-                try:
-                    # 2. 이후 3일간(오늘 포함)의 등락률 합산 및 평균 계산
-                    recent_rates = []
-                    for d in days[-3:]: # 최근 3일간
-                        df_d = stock.get_market_ohlcv_by_ticker(d, market=market)
-                        recent_rates.append(df_d.loc[t, '등락률'])
-                    
-                    avg_rate = sum(recent_rates) / 3
-                    
-                    # 3. 평균 등락률이 5% 이하(절대값 기준 횡보)인 종목 선정
-                    if abs(avg_rate) <= 5:
-                        res.append({
-                            '기업명': stock.get_market_ticker_name(t),
-                            '시총_v': df_cap.loc[t, '시가총액'],
-                            '등락률': df_today.loc[t, '등락률'], # 오늘의 등락률 표시
-                            '대금_v': df_today.loc[t, '거래대금']
-                        })
-                except: continue
-            return pd.DataFrame(res)
-
-        elif "연속 거래대금" in mode:
+        if "연속 거래대금" in mode:
             n = 3 if "3일" in mode else 5
             target_days = days[-n:]
             valid_tickers = None
-            stats_df = pd.DataFrame()
+            
+            # 기간 내 첫날 종가와 마지막날 종가, 거래대금 합계를 구하기 위함
+            first_day_df = stock.get_market_ohlcv_by_ticker(target_days[0], market=market)
+            last_day_df = stock.get_market_ohlcv_by_ticker(target_days[-1], market=market)
+            total_amt_series = pd.Series(0, index=df_today.index)
+
             for d in target_days:
                 df_day = stock.get_market_ohlcv_by_ticker(d, market=market)
-                cond = df_day[df_day['거래대금'] >= 100000000000].index
-                valid_tickers = set(cond) if valid_tickers is None else valid_tickers.intersection(set(cond))
-                if stats_df.empty: stats_df = df_day[['등락률', '거래대금']]
-                else: stats_df['등락률'] += df_day['등락률']; stats_df['거래대금'] += df_day['거래대금']
+                cond_1000b = df_day[df_day['거래대금'] >= 100000000000].index
+                if valid_tickers is None:
+                    valid_tickers = set(cond_1000b)
+                else:
+                    valid_tickers = valid_tickers.intersection(set(cond_1000b))
+                total_amt_series += df_day['거래대금']
+            
             if not valid_tickers: return pd.DataFrame()
-            res = [{'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': stats_df.loc[t, '등락률']/n, '대금_v': stats_df.loc[t, '거래대금']/n} for t in valid_tickers]
+            
+            res = []
+            for t in list(valid_tickers):
+                # 누적 변동률: (마지막날 종가 - 첫날 종가) / 첫날 종가 * 100
+                first_close = first_day_df.loc[t, '종가']
+                last_close = last_day_df.loc[t, '종가']
+                accum_rate = ((last_close - first_close) / first_close) * 100
+                
+                res.append({
+                    '기업명': stock.get_market_ticker_name(t),
+                    '시총_v': df_cap.loc[t, '시가총액'],
+                    '등락률': accum_rate,
+                    '대금_v': total_amt_series.loc[t] / n
+                })
+            return pd.DataFrame(res)
+
+        elif mode == "고가놀이":
+            if len(days) < 4: return pd.DataFrame()
+            base_date = days[-4]
+            df_base = stock.get_market_ohlcv_by_ticker(base_date, market=market)
+            targets = df_base[(df_base['거래대금'] >= 50000000000) & (df_base['등락률'] >= 15)].index
+            res = []
+            for t in targets:
+                try:
+                    recent_rates = [stock.get_market_ohlcv_by_ticker(d, market=market).loc[t, '등락률'] for d in days[-3:]]
+                    if abs(sum(recent_rates) / 3) <= 5:
+                        res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
+                except: continue
             return pd.DataFrame(res)
 
         elif mode == "역헤드앤숄더":
@@ -150,8 +153,7 @@ st.divider()
 
 if mode == "암호화폐":
     data = get_crypto_data()
-    if data.empty: st.info("데이터를 불러올 수 없습니다.")
-    else:
+    if not data.empty:
         data['현재가'] = data['현재가'].apply(lambda x: f"{x:,.0f}" if x >= 100 else f"{x:,.2f}")
         data['거래대금'] = data['거래대금'].apply(format_korean_unit)
         st.dataframe(data.style.map(lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=['전일대비']).format({'전일대비': '{:.1f}%'}), use_container_width=True, height=750, hide_index=True)
@@ -167,6 +169,18 @@ else:
                 data.insert(0, 'No', range(1, len(data) + 1))
                 data['시총'] = data['시총_v'].apply(format_korean_unit)
                 data['대금'] = data['대금_v'].apply(format_korean_unit)
-                l_rate = "평균등락" if "연속" in mode else "등락률"
-                l_amt = "평균대금" if "연속" in mode else "거래대금"
-                st.dataframe(data[['No', '기업명', '시총', '등락률', '대금']].rename(columns={'등락률': l_rate, '대금': l_amt}).style.map(lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=[l_rate]).format({l_rate: '{:.1f}%'}), use_container_width=True, height=600, hide_index=True)
+                
+                # --- 이름 변경 로직 ---
+                if "3일 연속" in mode:
+                    label_rate, label_amt = "3일 누적 변동", "3일 평균 대금"
+                elif "5일 연속" in mode:
+                    label_rate, label_amt = "5일 누적 변동", "5일 평균 대금"
+                else:
+                    label_rate, label_amt = "등락률", "거래대금"
+                
+                st.dataframe(
+                    data[['No', '기업명', '시총', '등락률', '대금']].rename(columns={'등락률': label_rate, '대금': label_amt}).style.map(
+                        lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=[label_rate]
+                    ).format({label_rate: '{:.1f}%'}),
+                    use_container_width=True, height=600, hide_index=True
+                )
