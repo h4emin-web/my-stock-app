@@ -27,70 +27,83 @@ def format_korean_unit(val):
         return f"{int(val // 1000000000000)}조"
     return f"{int(val // 100000000):,}억"
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_data(mode, date_s, market):
     try:
-        # 영업일 리스트 준비
-        start_search = (datetime.strptime(date_s, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
+        # 영업일 리스트 준비 (패턴 분석을 위해 40일치)
+        start_search = (datetime.strptime(date_s, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
         ohlcv_sample = stock.get_market_ohlcv_by_date(start_search, date_s, "005930")
         days = ohlcv_sample.index.strftime("%Y%m%d").tolist()
         
-        if "연속 거래대금" in mode:
+        if mode == "역헤드앤숄더":
+            # 거래대금 상위 100개 중 패턴 탐색 (연산 속도 고려)
+            df_top = stock.get_market_ohlcv_by_ticker(date_s, market=market).sort_values(by='거래대금', ascending=False).head(100)
+            df_cap = stock.get_market_cap_by_ticker(date_s, market=market)
+            res = []
+            
+            for t in df_top.index:
+                try:
+                    # 해당 종목의 최근 30일 종가 데이터
+                    df_hist = stock.get_market_ohlcv_by_date(days[-30], date_s, t)['종가']
+                    if len(df_hist) < 25: continue
+                    
+                    # 10일씩 3구간으로 나눠 저점 분석
+                    part1, part2, part3 = df_hist[:10], df_hist[10:20], df_hist[20:]
+                    low1, low2, low3 = part1.min(), part2.min(), part3.min()
+                    
+                    # 역헤드앤숄더 조건: 가운데(머리)가 양 옆(어깨)보다 낮아야 함
+                    if low2 < low1 and low2 < low3:
+                        # 오른쪽 어깨(low3)가 현재가 근처인지 (바닥 확인 후 반등 초입)
+                        current_price = df_hist.iloc[-1]
+                        if low3 <= current_price <= low3 * 1.07: # 바닥 대비 7% 이내
+                            res.append({
+                                '기업명': stock.get_market_ticker_name(t),
+                                '시총_v': df_cap.loc[t, '시가총액'],
+                                '등락률': df_top.loc[t, '등락률'],
+                                '대금_v': df_top.loc[t, '거래대금']
+                            })
+                except: continue
+            return pd.DataFrame(res).sort_values(by='대금_v', ascending=False)
+
+        elif "연속 거래대금" in mode:
             n = 3 if "3일" in mode else 5
             if len(days) < n: return pd.DataFrame()
-            
             target_days = days[-n:]
             valid_tickers = None
             stats_df = pd.DataFrame() 
-            
-            # n일 동안 매일 1,000억 이상인 종목 교집합 찾기
             for d in target_days:
                 df_day = stock.get_market_ohlcv_by_ticker(d, market=market)
                 cond_1000b = df_day[df_day['거래대금'] >= 100000000000].index
-                
                 if valid_tickers is None:
                     valid_tickers = set(cond_1000b)
                 else:
                     valid_tickers = valid_tickers.intersection(set(cond_1000b))
-                
                 if stats_df.empty:
                     stats_df = df_day[['등락률', '거래대금']]
                 else:
                     stats_df['등락률'] += df_day['등락률']
                     stats_df['거래대금'] += df_day['거래대금']
-            
             if not valid_tickers: return pd.DataFrame()
-            
             df_cap = stock.get_market_cap_by_ticker(date_s, market=market)
             res = []
             for t in list(valid_tickers):
                 res.append({
-                    '기업명': stock.get_market_ticker_name(t),
-                    '시총_v': df_cap.loc[t, '시가총액'] if t in df_cap.index else 0,
-                    '등락률': stats_df.loc[t, '등락률'] / n,
-                    '대금_v': stats_df.loc[t, '거래대금'] / n
+                    '기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'],
+                    '등락률': stats_df.loc[t, '등락률'] / n, '대금_v': stats_df.loc[t, '거래대금'] / n
                 })
             return pd.DataFrame(res).sort_values(by='대금_v', ascending=False)
 
         elif mode == "고가놀이":
             if len(days) < 4: return pd.DataFrame()
-            base_day = days[-4]
-            base_df = stock.get_market_ohlcv_by_ticker(base_day, market=market)
+            base_df = stock.get_market_ohlcv_by_ticker(days[-4], market=market)
             targets = base_df[(base_df['거래대금'] >= 50000000000) & (base_df['등락률'] >= 15)].index
-            
             res = []
             df_cap = stock.get_market_cap_by_ticker(date_s, market=market)
             for t in targets:
                 try:
                     rates = [stock.get_market_ohlcv_by_ticker(d, market=market).loc[t, '등락률'] for d in days[-3:]]
-                    avg_rate = sum(rates) / 3
-                    if abs(avg_rate) <= 5:
-                        res.append({
-                            '기업명': stock.get_market_ticker_name(t), 
-                            '시총_v': df_cap.loc[t, '시가총액'], 
-                            '등락률': rates[-1], 
-                            '대금_v': stock.get_market_ohlcv_by_ticker(date_s, market=market).loc[t, '거래대금']
-                        })
+                    if abs(sum(rates)/3) <= 5:
+                        res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': rates[-1], '대금_v': stock.get_market_ohlcv_by_ticker(date_s, market=market).loc[t, '거래대금']})
                 except: continue
             return pd.DataFrame(res).sort_values(by='대금_v', ascending=False)
 
@@ -110,7 +123,7 @@ def get_data(mode, date_s, market):
     except: return pd.DataFrame()
 
 # --- 앱 메인 UI ---
-st.title("해민증권🧑‍💼")  # 요청하신 이모티콘으로 변경
+st.title("해민증권🧑‍💼")
 
 try:
     init_date_str = stock.get_nearest_business_day_in_a_week()
@@ -124,7 +137,7 @@ with col1:
     date_s = d_input.strftime("%Y%m%d")
 with col2:
     mode = st.selectbox("분석 모드", [
-        "거래대금 상위", "3일 연속 거래대금", "5일 연속 거래대금", "상한가", "하한가", "고가놀이"
+        "거래대금 상위", "3일 연속 거래대금", "5일 연속 거래대금", "상한가", "하한가", "고가놀이", "역헤드앤숄더"
     ])
 
 st.divider()
@@ -133,7 +146,8 @@ t1, t2 = st.tabs(["KOSPI", "KOSDAQ"])
 
 for tab, mkt in zip([t1, t2], ["KOSPI", "KOSDAQ"]):
     with tab:
-        data = get_data(mode, date_s, mkt)
+        with st.spinner("데이터 불러오는 중..."):
+            data = get_data(mode, date_s, mkt)
         
         if data.empty:
             st.info("조건에 맞는 종목이 없습니다.")
