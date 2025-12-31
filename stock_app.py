@@ -4,11 +4,10 @@ import pandas as pd
 from datetime import datetime, timedelta
 import requests
 
-# 1. 앱 설정 및 로딩 메시지(Running...) 숨기기
+# 1. 앱 설정 및 로딩 메시지 숨기기
 st.set_page_config(page_title="해민증권", layout="centered", initial_sidebar_state="collapsed")
 st.markdown("""
     <style>
-    /* 로딩 아이콘 및 Status Widget 숨기기 */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
@@ -20,13 +19,13 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 데이터 포맷 함수 ---
+# --- 유틸리티 함수 ---
 def format_korean_unit(val):
     if pd.isna(val) or val == 0: return "0"
     if val >= 1000000000000: return f"{int(val // 1000000000000)}조"
     return f"{int(val // 100000000):,}억"
 
-# --- 암호화폐 데이터 ---
+# --- 암호화폐 데이터 (업비트) ---
 @st.cache_data(ttl=30)
 def get_crypto_data():
     try:
@@ -48,18 +47,26 @@ def get_crypto_data():
         return df
     except: return pd.DataFrame()
 
-# --- 주식 데이터 및 분석 로직 ---
+# --- 주식 데이터 및 분석 로직 (로딩 보정 강화) ---
 @st.cache_data(ttl=600, show_spinner=False)
 def get_data(mode, date_s, market):
     try:
+        # 1. 오늘 날짜 데이터 시도
+        df_today = stock.get_market_ohlcv_by_ticker(date_s, market=market)
+        
+        # 만약 오늘 데이터가 비어있다면(휴장일 등), 가장 최근 영업일로 자동 변경
+        if df_today.empty:
+            last_date = stock.get_nearest_business_day_in_a_week()
+            df_today = stock.get_market_ohlcv_by_ticker(last_date, market=market)
+            date_s = last_date
+        
+        df_cap = stock.get_market_cap_by_ticker(date_s, market=market)
+        
+        # 패턴 분석을 위한 과거 영업일 리스트
         start_search = (datetime.strptime(date_s, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
         ohlcv_sample = stock.get_market_ohlcv_by_date(start_search, date_s, "005930")
         days = ohlcv_sample.index.strftime("%Y%m%d").tolist()
-        if not days: return pd.DataFrame()
         
-        df_today = stock.get_market_ohlcv_by_ticker(date_s, market=market)
-        df_cap = stock.get_market_cap_by_ticker(date_s, market=market)
-
         if mode == "역헤드앤숄더":
             df_top = df_today.sort_values(by='거래대금', ascending=False).head(100)
             res = []
@@ -70,8 +77,7 @@ def get_data(mode, date_s, market):
                     p1, p2, p3 = df_hist[:10], df_hist[10:20], df_hist[20:]
                     l1, l2, l3 = p1.min(), p2.min(), p3.min()
                     if l2 < l1 and l2 < l3:
-                        current_price = df_hist.iloc[-1]
-                        if l3 <= current_price <= l3 * 1.07:
+                        if l3 <= df_hist.iloc[-1] <= l3 * 1.07:
                             res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
                 except: continue
             return pd.DataFrame(res)
@@ -98,14 +104,10 @@ def get_data(mode, date_s, market):
             for t in top_tickers:
                 try:
                     hist = stock.get_market_ohlcv_by_date(days[-6], date_s, t)
-                    if len(hist) < 5: continue
-                    # 최근 5일 내 15% 이상 상승 & 거래대금 500억 이상인 '기준봉' 탐색
                     main_candle = hist.iloc[:-1][(hist.iloc[:-1]['등락률'] >= 15) & (hist.iloc[:-1]['거래대금'] >= 50000000000)]
                     if not main_candle.empty:
-                        base_price = main_candle.iloc[-1]['종가']
-                        current_price = df_today.loc[t, '종가']
-                        # 기준봉 종가 대비 현재가가 -7% ~ +10% 내에서 유지 중인지 확인
-                        if base_price * 0.93 <= current_price <= base_price * 1.10:
+                        base_p = main_candle.iloc[-1]['종가']
+                        if base_p * 0.93 <= df_today.loc[t, '종가'] <= base_p * 1.10:
                             res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
                 except: continue
             return pd.DataFrame(res)
@@ -120,11 +122,13 @@ def get_data(mode, date_s, market):
             df = df_today.sort_values(by='거래대금', ascending=False).head(50)
             res = [{'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df.loc[t, '등락률'], '대금_v': df.loc[t, '거래대금']} for t in df.index]
             return pd.DataFrame(res)
-    except: return pd.DataFrame()
+    except Exception as e:
+        return pd.DataFrame()
 
 # --- 앱 메인 UI ---
 st.title("해민증권🧑‍💼")
 
+# 가장 최근 영업일 기본값 설정
 try:
     init_date_str = stock.get_nearest_business_day_in_a_week()
     default_d = datetime.strptime(init_date_str, "%Y%m%d")
@@ -152,7 +156,8 @@ else:
     for tab, mkt in zip([t1, t2], ["KOSPI", "KOSDAQ"]):
         with tab:
             data = get_data(mode, date_s, mkt)
-            if data.empty: st.info("조건에 맞는 종목이 없습니다.")
+            if data is None or data.empty:
+                st.info("데이터가 없거나 분석 조건에 맞는 종목이 없습니다.")
             else:
                 data = data.sort_values(by='대금_v', ascending=False)
                 data.insert(0, 'No', range(1, len(data) + 1))
