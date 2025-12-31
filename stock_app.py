@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import requests
 
-# 1. 앱 설정 및 로딩 메시지 숨기기
+# 1. 앱 설정 및 스타일
 st.set_page_config(page_title="해민증권", layout="centered", initial_sidebar_state="collapsed")
 st.markdown("""
     <style>
@@ -56,12 +56,11 @@ def get_data(mode, date_s, market):
         ohlcv_sample = stock.get_market_ohlcv_by_date(start_search, date_s, "005930")
         days = ohlcv_sample.index.strftime("%Y%m%d").tolist()
 
+        # 1. 연속 거래대금 (누적 변동 로직)
         if "연속 거래대금" in mode:
             n = 3 if "3일" in mode else 5
             target_days = days[-n:]
             valid_tickers = None
-            
-            # 기간 내 첫날 종가와 마지막날 종가, 거래대금 합계를 구하기 위함
             first_day_df = stock.get_market_ohlcv_by_ticker(target_days[0], market=market)
             last_day_df = stock.get_market_ohlcv_by_ticker(target_days[-1], market=market)
             total_amt_series = pd.Series(0, index=df_today.index)
@@ -69,29 +68,18 @@ def get_data(mode, date_s, market):
             for d in target_days:
                 df_day = stock.get_market_ohlcv_by_ticker(d, market=market)
                 cond_1000b = df_day[df_day['거래대금'] >= 100000000000].index
-                if valid_tickers is None:
-                    valid_tickers = set(cond_1000b)
-                else:
-                    valid_tickers = valid_tickers.intersection(set(cond_1000b))
+                valid_tickers = set(cond_1000b) if valid_tickers is None else valid_tickers.intersection(set(cond_1000b))
                 total_amt_series += df_day['거래대금']
             
             if not valid_tickers: return pd.DataFrame()
-            
             res = []
             for t in list(valid_tickers):
-                # 누적 변동률: (마지막날 종가 - 첫날 종가) / 첫날 종가 * 100
-                first_close = first_day_df.loc[t, '종가']
-                last_close = last_day_df.loc[t, '종가']
-                accum_rate = ((last_close - first_close) / first_close) * 100
-                
-                res.append({
-                    '기업명': stock.get_market_ticker_name(t),
-                    '시총_v': df_cap.loc[t, '시가총액'],
-                    '등락률': accum_rate,
-                    '대금_v': total_amt_series.loc[t] / n
-                })
+                f_close, l_close = first_day_df.loc[t, '종가'], last_day_df.loc[t, '종가']
+                accum_rate = ((l_close - f_close) / f_close) * 100
+                res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': accum_rate, '대금_v': total_amt_series.loc[t] / n})
             return pd.DataFrame(res)
 
+        # 2. 고가놀이 (500억/15% 이후 3일 횡보)
         elif mode == "고가놀이":
             if len(days) < 4: return pd.DataFrame()
             base_date = days[-4]
@@ -100,8 +88,8 @@ def get_data(mode, date_s, market):
             res = []
             for t in targets:
                 try:
-                    recent_rates = [stock.get_market_ohlcv_by_ticker(d, market=market).loc[t, '등락률'] for d in days[-3:]]
-                    if abs(sum(recent_rates) / 3) <= 5:
+                    rates = [stock.get_market_ohlcv_by_ticker(d, market=market).loc[t, '등락률'] for d in days[-3:]]
+                    if abs(sum(rates) / 3) <= 5:
                         res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
                 except: continue
             return pd.DataFrame(res)
@@ -112,12 +100,10 @@ def get_data(mode, date_s, market):
             for t in df_top.index:
                 try:
                     df_hist = stock.get_market_ohlcv_by_date(days[-30], date_s, t)['종가']
-                    if len(df_hist) < 25: continue
                     p1, p2, p3 = df_hist[:10], df_hist[10:20], df_hist[20:]
                     l1, l2, l3 = p1.min(), p2.min(), p3.min()
-                    if l2 < l1 and l2 < l3:
-                        if l3 <= df_hist.iloc[-1] <= l3 * 1.07:
-                            res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
+                    if l2 < l1 and l2 < l3 and l3 <= df_hist.iloc[-1] <= l3 * 1.07:
+                        res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
                 except: continue
             return pd.DataFrame(res)
 
@@ -152,7 +138,8 @@ with col2:
 st.divider()
 
 if mode == "암호화폐":
-    data = get_crypto_data()
+    with st.spinner("코인 시세를 불러오는 중..."):
+        data = get_crypto_data()
     if not data.empty:
         data['현재가'] = data['현재가'].apply(lambda x: f"{x:,.0f}" if x >= 100 else f"{x:,.2f}")
         data['거래대금'] = data['거래대금'].apply(format_korean_unit)
@@ -161,7 +148,10 @@ else:
     t1, t2 = st.tabs(["KOSPI", "KOSDAQ"])
     for tab, mkt in zip([t1, t2], ["KOSPI", "KOSDAQ"]):
         with tab:
-            data = get_data(mode, date_s, mkt)
+            # 주식 로딩 멘트 추가
+            with st.spinner(f"{mkt} 데이터를 불러오는 중..."):
+                data = get_data(mode, date_s, mkt)
+            
             if data is None or data.empty:
                 st.info("조건에 맞는 종목이 없습니다.")
             else:
@@ -170,17 +160,14 @@ else:
                 data['시총'] = data['시총_v'].apply(format_korean_unit)
                 data['대금'] = data['대금_v'].apply(format_korean_unit)
                 
-                # --- 이름 변경 로직 ---
-                if "3일 연속" in mode:
-                    label_rate, label_amt = "3일 누적 변동", "3일 평균 대금"
-                elif "5일 연속" in mode:
-                    label_rate, label_amt = "5일 누적 변동", "5일 평균 대금"
-                else:
-                    label_rate, label_amt = "등락률", "거래대금"
+                # 라벨 설정
+                if "3일 연속" in mode: l_rate, l_amt = "3일 누적 변동", "3일 평균 대금"
+                elif "5일 연속" in mode: l_rate, l_amt = "5일 누적 변동", "5일 평균 대금"
+                else: l_rate, l_amt = "등락률", "거래대금"
                 
                 st.dataframe(
-                    data[['No', '기업명', '시총', '등락률', '대금']].rename(columns={'등락률': label_rate, '대금': label_amt}).style.map(
-                        lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=[label_rate]
-                    ).format({label_rate: '{:.1f}%'}),
+                    data[['No', '기업명', '시총', '등락률', '대금']].rename(columns={'등락률': l_rate, '대금': l_amt}).style.map(
+                        lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=[l_rate]
+                    ).format({l_rate: '{:.1f}%'}),
                     use_container_width=True, height=600, hide_index=True
                 )
