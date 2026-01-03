@@ -6,7 +6,7 @@ import json
 import time
 
 # 1. 앱 설정 및 스타일
-st.set_page_config(page_title="Stock", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="해민증권", layout="centered", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
@@ -17,8 +17,8 @@ st.markdown("""
 # --- 한국투자증권 API 클래스 ---
 class KISApi:
     def __init__(self, app_key, app_secret):
-        self.app_key = "PSmBdpWduaskTXxqbcT6PuBTneKitnWiXnrL"
-        self.app_secret = "adyZ3eYxXM74UlaErGZWe1SEJ9RPNo2wOD/mDWkJqkKfB0re+zVtKNiZM5loyVumtm5It+jTdgplqbimwqnyboerycmQWrlgA/Uwm8u4K66LB6+PhIoO6kf8zS196RO570kjshkBBecQzUUfwLlDWBIlTu/Mvu4qYYi5dstnsjgZh3Ic2Sw="
+        self.app_key = app_key
+        self.app_secret = app_secret
         self.base_url = "https://openapi.koreainvestment.com:9443"
         self.token = None
         self.token_expires = None
@@ -62,10 +62,62 @@ class KISApi:
             "tr_id": tr_id
         }
     
-    def get_stock_price(self, stock_code):
-        """개별 종목 현재가 조회"""
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
-        tr_id = "FHKST01010100"
+    def get_volume_rank(self, market="0", date=""):
+        """거래량 순위 조회 - 상위 200개"""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
+        tr_id = "FHPST01710000"
+        headers = self.get_headers(tr_id)
+        
+        if not headers:
+            return pd.DataFrame()
+        
+        # market: 0=전체, 1=코스피, 2=코스닥
+        fid_cond_mrkt_div_code = "J"
+        fid_blng_cls_code = market
+        
+        params = {
+            "fid_cond_mrkt_div_code": fid_cond_mrkt_div_code,
+            "fid_cond_scr_div_code": "20171",
+            "fid_input_iscd": "0000",
+            "fid_div_cls_code": "0",
+            "fid_blng_cls_code": fid_blng_cls_code,
+            "fid_trgt_cls_code": "111111111",
+            "fid_trgt_exls_cls_code": "0000000000",
+            "fid_input_price_1": "",
+            "fid_input_price_2": "",
+            "fid_vol_cnt": "",
+            "fid_input_date_1": date
+        }
+        
+        try:
+            res = requests.get(url, headers=headers, params=params)
+            if res.status_code == 200:
+                data = res.json()
+                outputs = data.get('output', [])
+                
+                result_list = []
+                for item in outputs:
+                    result_list.append({
+                        '종목코드': item['mksc_shrn_iscd'],
+                        '종목명': item['hts_kor_isnm'],
+                        '현재가': int(item['stck_prpr']),
+                        '전일대비': int(item['prdy_vrss']),
+                        '등락률': float(item['prdy_ctrt']),
+                        '거래량': int(item['acml_vol']),
+                        '거래대금': int(item['acml_tr_pbmn']),
+                        '시가총액': int(item['stck_prpr']) * int(item['lstn_stcn']) if item.get('lstn_stcn') else 0
+                    })
+                
+                return pd.DataFrame(result_list)
+        except Exception as e:
+            st.error(f"거래량 순위 조회 오류: {e}")
+        
+        return pd.DataFrame()
+    
+    def get_price_by_day(self, stock_code, date):
+        """특정일 주식 시세 조회"""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        tr_id = "FHKST03010100"
         headers = self.get_headers(tr_id)
         
         if not headers:
@@ -73,19 +125,27 @@ class KISApi:
         
         params = {
             "fid_cond_mrkt_div_code": "J",
-            "fid_input_iscd": stock_code
+            "fid_input_iscd": stock_code,
+            "fid_input_date_1": date,
+            "fid_input_date_2": date,
+            "fid_period_div_code": "D",
+            "fid_org_adj_prc": "0"
         }
         
         try:
             res = requests.get(url, headers=headers, params=params)
             if res.status_code == 200:
-                return res.json()['output']
+                data = res.json()
+                output = data.get('output2', [])
+                if output:
+                    return output[0]
         except:
             pass
+        
         return None
     
-    def get_daily_price(self, stock_code, start_date, end_date):
-        """일별 시세 조회"""
+    def get_price_range(self, stock_code, start_date, end_date):
+        """기간별 주식 시세 조회"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         tr_id = "FHKST03010100"
         headers = self.get_headers(tr_id)
@@ -109,88 +169,31 @@ class KISApi:
                 return data.get('output2', [])
         except:
             pass
+        
         return []
     
-    def get_market_cap(self, stock_code):
-        """시가총액 조회"""
-        data = self.get_stock_price(stock_code)
-        if data:
-            # 시가총액 = 현재가 * 상장주식수
-            price = int(data.get('stck_prpr', 0))
-            vol = int(data.get('lstn_stcn', 0))
-            return price * vol
-        return 0
-    
-    def get_all_stocks(self, market="0"):
-        """전체 종목 코드 조회 (거래량 상위 종목)"""
-        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank"
-        tr_id = "FHPST01710000"
+    def get_current_price(self, stock_code):
+        """현재가 조회"""
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+        tr_id = "FHKST01010100"
         headers = self.get_headers(tr_id)
         
         if not headers:
-            return []
-        
-        # market: 0=전체, 1=코스피, 2=코스닥
-        fid_cond_mrkt_div_code = "J" if market in ["0", "1"] else "Q"
-        
-        all_stocks = []
+            return None
         
         params = {
-            "fid_cond_mrkt_div_code": fid_cond_mrkt_div_code,
-            "fid_cond_scr_div_code": "20171",
-            "fid_input_iscd": "0000",
-            "fid_div_cls_code": "0",
-            "fid_blng_cls_code": market,
-            "fid_trgt_cls_code": "111111111",
-            "fid_trgt_exls_cls_code": "0000000000",
-            "fid_input_price_1": "",
-            "fid_input_price_2": "",
-            "fid_vol_cnt": "",
-            "fid_input_date_1": ""
+            "fid_cond_mrkt_div_code": "J",
+            "fid_input_iscd": stock_code
         }
         
         try:
             res = requests.get(url, headers=headers, params=params)
             if res.status_code == 200:
-                data = res.json()
-                outputs = data.get('output', [])
-                for item in outputs[:200]:  # 상위 200개 종목
-                    all_stocks.append(item['mksc_shrn_iscd'])
-        except Exception as e:
-            st.error(f"종목 조회 오류: {e}")
+                return res.json()['output']
+        except:
+            pass
         
-        return all_stocks
-    
-    def get_market_data_bulk(self, stock_list, date):
-        """여러 종목의 시세를 한번에 조회"""
-        result_list = []
-        
-        for i, stock_code in enumerate(stock_list):
-            if i > 0 and i % 20 == 0:  # API 호출 제한 (초당 20건)
-                time.sleep(1)
-            
-            daily_data = self.get_daily_price(stock_code, date, date)
-            
-            if daily_data and len(daily_data) > 0:
-                output = daily_data[0]
-                
-                try:
-                    result_list.append({
-                        '종목코드': stock_code,
-                        '종목명': output.get('hts_kor_isnm', ''),
-                        '종가': int(output.get('stck_clpr', 0)),
-                        '시가': int(output.get('stck_oprc', 0)),
-                        '고가': int(output.get('stck_hgpr', 0)),
-                        '저가': int(output.get('stck_lwpr', 0)),
-                        '거래량': int(output.get('acml_vol', 0)),
-                        '거래대금': int(output.get('acml_tr_pbmn', 0)),
-                        '등락률': float(output.get('prdy_ctrt', 0)),
-                        '시가총액': int(output.get('stck_prpr', 0)) * int(output.get('lstn_stcn', 0)) if output.get('lstn_stcn') else 0
-                    })
-                except:
-                    continue
-        
-        return pd.DataFrame(result_list)
+        return None
 
 # --- 유틸리티 함수 ---
 def format_korean_unit(val):
@@ -249,161 +252,114 @@ def get_data(mode, date_s, market, kis_api):
         end_date = datetime.strptime(date_s, "%Y%m%d")
         market_code = "1" if market == "KOSPI" else "2"
         
-        # 종목 리스트 조회
-        with st.spinner(f"{market} 종목 리스트 조회 중..."):
-            stock_list = kis_api.get_all_stocks(market_code)
-        
-        if not stock_list:
-            return pd.DataFrame()
-        
-        # 1. 연속 거래대금
-        if "연속 거래대금" in mode:
-            n = 3 if "3일" in mode else 5
-            business_days = get_business_days(end_date, n)
+        # 1. 거래대금 상위
+        if mode == "거래대금 상위":
+            df = kis_api.get_volume_rank(market_code, date_s)
             
-            # n일간 데이터 수집
-            all_data = {}
-            for day in business_days:
-                with st.spinner(f"{day} 데이터 조회 중..."):
-                    df_day = kis_api.get_market_data_bulk(stock_list, day)
-                    all_data[day] = df_day
-            
-            # 조건 검사: 모든 날짜에 1000억 이상 거래대금
-            valid_stocks = None
-            total_amt = {}
-            first_price = {}
-            last_price = {}
-            
-            for i, (day, df) in enumerate(all_data.items()):
-                if df.empty:
-                    continue
-                
-                cond_stocks = set(df[df['거래대금'] >= 100000000000]['종목코드'].tolist())
-                
-                if valid_stocks is None:
-                    valid_stocks = cond_stocks
-                else:
-                    valid_stocks = valid_stocks.intersection(cond_stocks)
-                
-                # 거래대금 누적
-                for _, row in df.iterrows():
-                    code = row['종목코드']
-                    total_amt[code] = total_amt.get(code, 0) + row['거래대금']
-                    
-                    if i == 0:
-                        first_price[code] = row['종가']
-                    if i == len(business_days) - 1:
-                        last_price[code] = row['종가']
-            
-            if not valid_stocks:
+            if df.empty:
                 return pd.DataFrame()
             
-            res = []
-            last_df = all_data[business_days[-1]]
+            # 거래대금 순으로 정렬하고 상위 50개
+            df = df.sort_values(by='거래대금', ascending=False).head(50)
             
-            for code in valid_stocks:
-                if code in first_price and code in last_price:
-                    accum_rate = ((last_price[code] - first_price[code]) / first_price[code]) * 100
-                    
-                    stock_row = last_df[last_df['종목코드'] == code].iloc[0]
-                    
-                    res.append({
-                        '기업명': stock_row['종목명'],
-                        '시총_v': stock_row['시가총액'],
-                        '등락률': accum_rate,
-                        '대금_v': total_amt[code] / n
-                    })
+            res = []
+            for _, row in df.iterrows():
+                res.append({
+                    '기업명': row['종목명'],
+                    '시총_v': row['시가총액'],
+                    '등락률': row['등락률'],
+                    '대금_v': row['거래대금']
+                })
             
             return pd.DataFrame(res)
         
-        # 2. 고가놀이
-        elif mode == "고가놀이":
-            business_days = get_business_days(end_date, 4)
+        # 2. 3일/5일 연속 거래대금
+        elif "연속 거래대금" in mode:
+            n = 3 if "3일" in mode else 5
+            business_days = get_business_days(end_date, n)
             
-            # 4일전 데이터 (500억, 15% 이상)
-            with st.spinner("4일전 데이터 조회 중..."):
-                df_base = kis_api.get_market_data_bulk(stock_list, business_days[0])
+            st.info(f"조회 기간: {business_days[0]} ~ {business_days[-1]}")
+            
+            # 첫날 거래량 순위로 종목 리스트 가져오기
+            df_base = kis_api.get_volume_rank(market_code, business_days[-1])
             
             if df_base.empty:
                 return pd.DataFrame()
             
-            targets = df_base[(df_base['거래대금'] >= 50000000000) & (df_base['등락률'] >= 15)]['종목코드'].tolist()
+            # 상위 100개 종목만 체크
+            stock_list = df_base.head(100)['종목코드'].tolist()
             
-            # 최근 3일 등락률 확인
-            recent_3days = business_days[-3:]
-            res = []
+            valid_stocks = []
+            stock_data = {}
             
-            for code in targets:
-                rates = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, stock_code in enumerate(stock_list):
+                status_text.text(f"분석 중: {idx+1}/{len(stock_list)} ({stock_code})")
+                progress_bar.progress((idx + 1) / len(stock_list))
+                
+                # n일간 데이터 조회
+                daily_amounts = []
+                daily_prices = []
                 stock_name = ""
+                market_cap = 0
                 
-                for day in recent_3days:
-                    daily_data = kis_api.get_daily_price(code, day, day)
-                    if daily_data:
-                        rates.append(float(daily_data[0].get('prdy_ctrt', 0)))
-                        stock_name = daily_data[0].get('hts_kor_isnm', '')
+                for day in business_days:
+                    time.sleep(0.05)  # API 호출 제한 대응
+                    
+                    price_data = kis_api.get_price_by_day(stock_code, day)
+                    
+                    if price_data:
+                        amount = int(price_data.get('acml_tr_pbmn', 0))
+                        close = int(price_data.get('stck_clpr', 0))
+                        
+                        daily_amounts.append(amount)
+                        daily_prices.append(close)
+                        
+                        if not stock_name:
+                            stock_name = price_data.get('hts_kor_isnm', '')
+                            lstn_stcn = int(price_data.get('lstn_stcn', 0))
+                            market_cap = close * lstn_stcn
                 
-                if len(rates) == 3 and abs(sum(rates) / 3) <= 5:
-                    last_data = kis_api.get_daily_price(code, business_days[-1], business_days[-1])
-                    if last_data:
-                        output = last_data[0]
-                        res.append({
+                # n일 모두 거래대금 1000억 이상인지 체크
+                if len(daily_amounts) == n and all(amt >= 100000000000 for amt in daily_amounts):
+                    avg_amount = sum(daily_amounts) / n
+                    
+                    # 누적 변동률 계산
+                    if len(daily_prices) == n:
+                        accum_rate = ((daily_prices[-1] - daily_prices[0]) / daily_prices[0]) * 100
+                        
+                        stock_data[stock_code] = {
                             '기업명': stock_name,
-                            '시총_v': int(output.get('stck_prpr', 0)) * int(output.get('lstn_stcn', 0)),
-                            '등락률': float(output.get('prdy_ctrt', 0)),
-                            '대금_v': int(output.get('acml_tr_pbmn', 0))
-                        })
+                            '시총_v': market_cap,
+                            '등락률': accum_rate,
+                            '대금_v': avg_amount
+                        }
+                        valid_stocks.append(stock_code)
             
-            return pd.DataFrame(res)
-        
-        # 3. 역헤드앤숄더
-        elif mode == "역헤드앤숄더":
-            with st.spinner("거래대금 상위 종목 조회 중..."):
-                df_today = kis_api.get_market_data_bulk(stock_list, date_s)
+            progress_bar.empty()
+            status_text.empty()
             
-            if df_today.empty:
+            if not valid_stocks:
                 return pd.DataFrame()
             
-            top_stocks = df_today.sort_values(by='거래대금', ascending=False).head(100)['종목코드'].tolist()
-            
-            business_days = get_business_days(end_date, 30)
-            res = []
-            
-            for code in top_stocks:
-                with st.spinner(f"{code} 패턴 분석 중..."):
-                    daily_data = kis_api.get_daily_price(code, business_days[0], business_days[-1])
-                
-                if len(daily_data) >= 30:
-                    closes = [int(d.get('stck_clpr', 0)) for d in reversed(daily_data)]
-                    
-                    p1, p2, p3 = closes[:10], closes[10:20], closes[20:]
-                    l1, l2, l3 = min(p1), min(p2), min(p3)
-                    
-                    if l2 < l1 and l2 < l3 and l3 <= closes[-1] <= l3 * 1.07:
-                        stock_row = df_today[df_today['종목코드'] == code].iloc[0]
-                        res.append({
-                            '기업명': stock_row['종목명'],
-                            '시총_v': stock_row['시가총액'],
-                            '등락률': stock_row['등락률'],
-                            '대금_v': stock_row['거래대금']
-                        })
-            
+            res = [stock_data[code] for code in valid_stocks]
             return pd.DataFrame(res)
         
-        # 4. 상한가/하한가
+        # 3. 상한가/하한가
         elif mode in ["상한가", "하한가"]:
-            with st.spinner(f"{mode} 종목 조회 중..."):
-                df_today = kis_api.get_market_data_bulk(stock_list, date_s)
+            df = kis_api.get_volume_rank(market_code, date_s)
             
-            if df_today.empty:
+            if df.empty:
                 return pd.DataFrame()
             
             if mode == "상한가":
-                condition = df_today['등락률'] >= 29.5
+                condition = df['등락률'] >= 29.5
             else:
-                condition = df_today['등락률'] <= -29.5
+                condition = df['등락률'] <= -29.5
             
-            result_df = df_today[condition]
+            result_df = df[condition]
             
             res = []
             for _, row in result_df.iterrows():
@@ -416,29 +372,120 @@ def get_data(mode, date_s, market, kis_api):
             
             return pd.DataFrame(res)
         
-        # 5. 거래대금 상위
-        else:
-            with st.spinner("거래대금 상위 종목 조회 중..."):
-                df_today = kis_api.get_market_data_bulk(stock_list, date_s)
+        # 4. 고가놀이
+        elif mode == "고가놀이":
+            business_days = get_business_days(end_date, 4)
+            
+            st.info(f"조회 기간: {business_days[0]} ~ {business_days[-1]}")
+            
+            # 4일 전 거래량 순위
+            df_base = kis_api.get_volume_rank(market_code, business_days[0])
+            
+            if df_base.empty:
+                return pd.DataFrame()
+            
+            # 4일전에 500억 이상, 15% 이상 상승한 종목
+            targets = df_base[(df_base['거래대금'] >= 50000000000) & (df_base['등락률'] >= 15)]
+            
+            res = []
+            recent_3days = business_days[-3:]
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, (_, row) in enumerate(targets.iterrows()):
+                stock_code = row['종목코드']
+                status_text.text(f"분석 중: {idx+1}/{len(targets)} ({stock_code})")
+                progress_bar.progress((idx + 1) / len(targets))
+                
+                # 최근 3일 등락률 확인
+                rates = []
+                
+                for day in recent_3days:
+                    time.sleep(0.05)
+                    price_data = kis_api.get_price_by_day(stock_code, day)
+                    if price_data:
+                        rates.append(float(price_data.get('prdy_ctrt', 0)))
+                
+                # 3일 평균 등락률이 ±5% 이내 (횡보)
+                if len(rates) == 3 and abs(sum(rates) / 3) <= 5:
+                    # 마지막 날 데이터
+                    last_data = kis_api.get_price_by_day(stock_code, business_days[-1])
+                    
+                    if last_data:
+                        res.append({
+                            '기업명': last_data.get('hts_kor_isnm', ''),
+                            '시총_v': int(last_data.get('stck_clpr', 0)) * int(last_data.get('lstn_stcn', 0)),
+                            '등락률': float(last_data.get('prdy_ctrt', 0)),
+                            '대금_v': int(last_data.get('acml_tr_pbmn', 0))
+                        })
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            return pd.DataFrame(res)
+        
+        # 5. 역헤드앤숄더
+        elif mode == "역헤드앤숄더":
+            business_days = get_business_days(end_date, 30)
+            
+            st.info(f"조회 기간: {business_days[0]} ~ {business_days[-1]}")
+            
+            # 거래대금 상위 100개
+            df_today = kis_api.get_volume_rank(market_code, date_s)
             
             if df_today.empty:
                 return pd.DataFrame()
             
-            top_df = df_today.sort_values(by='거래대금', ascending=False).head(50)
+            top_stocks = df_today.head(100)
             
             res = []
-            for _, row in top_df.iterrows():
-                res.append({
-                    '기업명': row['종목명'],
-                    '시총_v': row['시가총액'],
-                    '등락률': row['등락률'],
-                    '대금_v': row['거래대금']
-                })
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, (_, row) in enumerate(top_stocks.iterrows()):
+                stock_code = row['종목코드']
+                status_text.text(f"패턴 분석 중: {idx+1}/{len(top_stocks)} ({stock_code})")
+                progress_bar.progress((idx + 1) / len(top_stocks))
+                
+                time.sleep(0.05)
+                
+                # 30일간 데이터 조회
+                price_range = kis_api.get_price_range(stock_code, business_days[0], business_days[-1])
+                
+                if len(price_range) >= 30:
+                    # 최신순으로 정렬되어 있으므로 역순으로
+                    closes = [int(d.get('stck_clpr', 0)) for d in reversed(price_range)]
+                    
+                    # 3구간으로 나누기
+                    p1 = closes[:10]
+                    p2 = closes[10:20]
+                    p3 = closes[20:]
+                    
+                    l1, l2, l3 = min(p1), min(p2), min(p3)
+                    
+                    # 역헤드앤숄더 패턴: l2가 가장 낮고, l3 근처에서 형성 중
+                    if l2 < l1 and l2 < l3 and l3 <= closes[-1] <= l3 * 1.07:
+                        res.append({
+                            '기업명': row['종목명'],
+                            '시총_v': row['시가총액'],
+                            '등락률': row['등락률'],
+                            '대금_v': row['거래대금']
+                        })
+            
+            progress_bar.empty()
+            status_text.empty()
             
             return pd.DataFrame(res)
+        
+        else:
+            return pd.DataFrame()
     
     except Exception as e:
         st.error(f"데이터 조회 오류: {e}")
+        import traceback
+        st.error(traceback.format_exc())
         return pd.DataFrame()
 
 # --- 앱 메인 UI ---
@@ -484,6 +531,10 @@ with st.sidebar:
     2. API 연결 버튼 클릭
     3. 날짜와 분석 모드 선택
     4. 데이터 조회
+    
+    **참고:**
+    - 3일/5일 연속: 시간이 다소 소요됩니다
+    - API 제한으로 상위 100개 종목만 분석
     """)
 
 # API 연결 확인
