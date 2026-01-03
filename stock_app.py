@@ -9,8 +9,8 @@ import time
 st.set_page_config(page_title="Stock", layout="centered")
 
 # --- 한투 API 인증 정보 (여기에 발급받으신 키를 넣으세요) ---
-APP_KEY = "PSmBdpWduaskTXxqbcT6PuBTneKitnWiXnrL_APP_KEY"
-APP_SECRET = "adyZ3eYxXM74UlaErGZWe1SEJ9RPNo2wOD/mDWkJqkKfB0re+zVtKNiZM5loyVumtm5It+jTdgplqbimwqnyboerycmQWrlgA/Uwm8u4K66LB6+PhIoO6kf8zS196RO570kjshkBBecQzUUfwLlDWBIlTu/Mvu4qYYi5dstnsjgZh3Ic2Sw=_APP_SECRET"
+APP_KEY = "PSmBdpWduaskTXxqbcT6PuBTneKitnWiXnrL"
+APP_SECRET = "adyZ3eYxXM74UlaErGZWe1SEJ9RPNo2wOD/mDWkJqkKfB0re+zVtKNiZM5loyVumtm5It+jTdgplqbimwqnyboerycmQWrlgA/Uwm8u4K66LB6+PhIoO6kf8zS196RO570kjshkBBecQzUUfwLlDWBIlTu/Mvu4qYYi5dstnsjgZh3Ic2Sw="
 URL_BASE = "https://openapi.koreainvestment.com:9443" # 실전 투자용 주소
 
 # --- 인증 토큰 발급 함수 ---
