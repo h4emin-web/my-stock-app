@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import requests
 
 # 1. 앱 설정 및 스타일
-st.set_page_config(page_title="해민증권", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Stock", layout="centered", initial_sidebar_state="collapsed")
 st.markdown("""
     <style>
     #MainMenu {visibility: hidden;}
@@ -171,3 +171,4 @@ else:
                     ).format({l_rate: '{:.1f}%'}),
                     use_container_width=True, height=600, hide_index=True
                 )
+
