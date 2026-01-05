@@ -4,122 +4,97 @@ import requests
 import json
 import time
 
-# --- 1. 인증 정보 (공백이 없는지 꼭 확인하세요) ---
-APP_KEY = "PSmBdpWduaskTXxqbcT6PuBTneKitnWiXnrL"
-APP_SECRET = "adyZ3eYxXM74UlaErGZWe1SEJ9RPNo2wOD/mDWkJqkKfB0re+zVtKNiZM5loyVumtm5It+jTdgplqbimwqnyboerycmQWrlgA/Uwm8u4K66LB6+PhIoO6kf8zS196RO570kjshkBBecQzUUfwLlDWBIlTu/Mvu4qYYi5dstnsjgZh3Ic2Sw="
+# --- 인증 정보 (한국투자증권 실전투자용) ---
+APP_KEY = "PSmBdpWduaskTXxqbcT6PuBTneKitnWiXnrL".strip()
+APP_SECRET = "adyZ3eYxXM74UlaErGZWe1SEJ9RPNo2wOD/mDWkJqkKfB0re+zVtKNiZM5loyVumtm5It+jTdgplqbimwqnyboerycmQWrlgA/Uwm8u4K66LB6+PhIoO6kf8zS196RO570kjshkBBecQzUUfwLlDWBIlTu/Mvu4qYYi5dstnsjgZh3Ic2Sw=".strip()
 URL_BASE = "https://openapi.koreainvestment.com:9443"
 
 def get_token():
     url = f"{URL_BASE}/oauth2/tokenP"
-    body = {"grant_type": "client_credentials", "appkey": APP_KEY.strip(), "appsecret": APP_SECRET.strip()}
+    body = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
     res = requests.post(url, data=json.dumps(body))
-    try:
-        data = res.json()
-        if res.status_code == 200:
-            return data.get('access_token')
-        else:
-            st.error(f"❌ 토큰 발급 실패 (코드 {res.status_code}): {data.get('msg1', '알 수 없는 에러')}")
-            return None
-    except:
-        st.error(f"❌ 서버 응답이 JSON 형식이 아닙니다 (HTML 응답): {res.text[:200]}")
-        return None
+    return res.json().get('access_token')
 
 def fetch_kis(path, tr_id, params):
-    token = get_token()
-    if not token: return None
-    
     headers = {
-        "Content-Type": "application/json", 
-        "authorization": f"Bearer {token}",
-        "appkey": APP_KEY.strip(), 
-        "appsecret": APP_SECRET.strip(), 
-        "tr_id": tr_id, 
-        "custtype": "P"
+        "Content-Type": "application/json", "authorization": f"Bearer {get_token()}",
+        "appkey": APP_KEY, "appsecret": APP_SECRET, "tr_id": tr_id, "custtype": "P"
     }
-    
     res = requests.get(f"{URL_BASE}{path}", headers=headers, params=params)
-    
-    try:
-        return res.json()
-    except Exception:
-        # JSON이 아닌 경우 에러 상세 출력
-        st.error(f"❌ 데이터 해석 실패! 서버에서 아래와 같이 응답했습니다:\n\n {res.text[:300]}")
-        return None
+    return res.json()
 
-# --- 2. 분석 로직 (거래대금순 정렬 보강) ---
-def get_analyzed_data(mode, mkt_id):
+def analyze_high_pattern(mkt_id):
+    # 1. 일단 시장에서 거래대금이 많이 터지는 종목 50개를 먼저 가져옴
     p = {
         "FID_COND_MRKT_DIV_CODE": "J", "FID_COND_SCR_DIV_CODE": "20171",
         "FID_INPUT_ISCD": mkt_id, "FID_DIV_CLS_CODE": "0", "FID_BLNG_CLS_CODE": "0",
-        "FID_TRGT_CLS_CODE": "0", "FID_TRGT_EXLS_CLS_CODE": "0", "FID_INPUT_PRICE_1": "0",
-        "FID_INPUT_PRICE_2": "0", "FID_VOL_CNT": "0"
+        "FID_TRGT_CLS_CODE": "0", "FID_TRGT_EXLS_CLS_CODE": "0", "FID_INPUT_PRICE_1": "",
+        "FID_INPUT_PRICE_2": "", "FID_VOL_CNT": ""
     }
     raw = fetch_kis("/uapi/domestic-stock/v1/ranking/trade-value", "FHPST01710000", p)
     
     if not raw or 'output' not in raw:
+        st.error("데이터를 불러오지 못했습니다. API 키나 서버 상태를 확인하세요.")
         return pd.DataFrame()
     
     results = []
-    prog = st.progress(0)
+    items = raw['output'][:30] # 상위 30개 집중 분석
     
-    # 상위 25개 분석 (거래대금 순서 유지)
-    for i, item in enumerate(raw['output'][:25]):
-        prog.progress((i+1)/25)
+    prog = st.progress(0)
+    status_text = st.empty()
+
+    for i, item in enumerate(items):
         ticker = item['mksc_shrn_iscd']
         name = item['hts_kor_isnm']
+        status_text.text(f"🔍 {name} 패턴 분석 중...")
+        prog.progress((i+1)/len(items))
         
-        # 일봉 조회
+        # 2. 각 종목의 최근 10일치 차트 데이터 조회
         p_hist = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"}
         hist = fetch_kis("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100", p_hist)
         
-        if hist and 'output2' in hist and len(hist['output2']) > 0:
+        if hist and 'output2' in hist and len(hist['output2']) > 5:
             days = hist['output2']
-            amt = float(days[0]['acml_tr_pbmn'])
-            rate = float(days[0]['prdy_ctrt'])
             
-            match = False
-            if mode == "거래대금 상위": match = True
-            elif "연속 거래대금" in mode:
-                n = 3 if "3일" in mode else 5
-                if len(days) >= n:
-                    # 완화된 기준: n일 연속 300억 이상
-                    if all(float(days[j]['acml_tr_pbmn']) >= 30000000000 for j in range(n)):
-                        match = True
-            elif mode == "고가놀이":
-                if len(days) >= 4 and float(days[3]['prdy_ctrt']) >= 15:
-                    if abs(sum(float(days[j]['prdy_ctrt']) for j in range(3))/3) <= 5:
-                        match = True
+            # [조건 1] 최근 10일 이내에 하루라도 15% 이상 급등한 적이 있는가?
+            spike_day = [float(d['prdy_ctrt']) >= 15 for d in days[1:10]]
             
-            if match:
+            # [조건 2] 오늘 등락률이 -5% ~ +5% 사이로 횡보 중인가? (고가에서 버티기)
+            today_rate = float(days[0]['prdy_ctrt'])
+            is_sideways = -5.0 <= today_rate <= 5.0
+            
+            # [조건 3] 오늘 거래대금이 최소 200억 이상인가? (관심이 살아있는가)
+            today_amt = float(days[0]['acml_tr_pbmn'])
+            has_volume = today_amt >= 20000000000
+            
+            if any(spike_day) and is_sideways and has_volume:
                 results.append({
                     "종목명": name,
                     "현재가": f"{int(float(days[0]['stck_clpr'])):,}원",
-                    "등락률": rate,
-                    "거래대금": amt,
-                    "거래대금(억)": f"{int(amt//100000000):,}억"
+                    "등락률": f"{today_rate:.2f}%",
+                    "거래대금": f"{int(today_amt//100000000):,}억",
+                    "최고등락(10일내)": f"{max([float(d['prdy_ctrt']) for d in days[1:10]]):.1f}%"
                 })
-        time.sleep(0.05)
+        
+        time.sleep(0.1) # API 차단 방지
 
     prog.empty()
-    df = pd.DataFrame(results)
-    return df.sort_values(by="거래대금", ascending=False) if not df.empty else df
+    status_text.empty()
+    return pd.DataFrame(results)
 
-# --- 3. UI ---
-st.title("📈 해민증권 실시간 분석기")
+# --- UI ---
+st.title("🔥 고가놀이 종목 발굴기")
+st.caption("최근 급등 후 고점에서 매물을 소화하며 횡보하는 종목을 찾습니다.")
 
-mode = st.selectbox("분석 모드", ["거래대금 상위", "3일 연속 거래대금", "5일 연속 거래대금", "고가놀이"])
-mkt_name = st.radio("시장", ["KOSPI", "KOSDAQ"], horizontal=True)
-mkt_id = "0001" if mkt_name == "KOSPI" else "1001"
+mkt = st.radio("분석 시장 선택", ["KOSPI", "KOSDAQ"], horizontal=True)
+mkt_id = "0001" if mkt == "KOSPI" else "1001"
 
-if st.button("실시간 데이터 분석 시작"):
-    with st.spinner("한국투자증권 서버와 통신 중..."):
-        df = get_analyzed_data(mode, mkt_id)
+if st.button("고가놀이 종목 찾기"):
+    with st.spinner("최근 10일간의 차트를 전수 분석 중..."):
+        df = analyze_high_pattern(mkt_id)
+        
         if not df.empty:
-            st.dataframe(
-                df[['종목명', '현재가', '등락률', '거래대금(억)']].style.map(
-                    lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=['등락률']
-                ).format({'등락률': '{:.2f}%'}),
-                use_container_width=True, hide_index=True
-            )
+            st.success(f"조건에 딱 맞는 종목을 {len(df)}개 발견했습니다!")
+            st.table(df) # 깔끔하게 표로 출력
         else:
-            st.warning("조건에 맞는 종목이 없거나 API 응답에 문제가 있습니다.")
+            st.warning("현재 고가놀이 패턴을 보이는 종목이 없습니다. 시장을 변경해보세요.")
