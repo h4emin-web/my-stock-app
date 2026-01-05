@@ -1,188 +1,142 @@
 import streamlit as st
-from pykrx import stock
 import pandas as pd
-from datetime import datetime, timedelta
 import requests
+import json
 import time
 
 # 1. 앱 설정 및 스타일
-st.set_page_config(page_title="Stock", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Stock Analyzer", layout="centered", initial_sidebar_state="collapsed")
 st.markdown("""
     <style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    div[data-testid="stStatusWidget"] {display: none !important;}
-    .block-container { padding-top: 1.5rem; padding-left: 1rem; padding-right: 1rem; }
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
+    .block-container { padding-top: 1.5rem; }
     .stTabs [data-baseweb="tab"] { font-size: 18px; font-weight: bold; flex: 1; text-align: center; }
-    .stSelectbox label { font-size: 14px; font-weight: bold; }
-    [data-testid="stDataFrame"] td { height: 45px !important; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 유틸리티 함수 ---
-def format_korean_unit(val):
-    if pd.isna(val) or val == 0: return "0"
-    if val >= 1000000000000: return f"{int(val // 1000000000000)}조"
-    return f"{int(val // 100000000):,}억"
+# --- 🔐 [인증 정보] ---
+APP_KEY = "PSmBdpWduaskTXxqbcT6PuBTneKitnWiXnrL"
+APP_SECRET = "adyZ3eYxXM74UlaErGZWe1SEJ9RPNo2wOD/mDWkJqkKfB0re+zVtKNiZM5loyVumtm5It+jTdgplqbimwqnyboerycmQWrlgA/Uwm8u4K66LB6+PhIoO6kf8zS196RO570kjshkBBecQzUUfwLlDWBIlTu/Mvu4qYYi5dstnsjgZh3Ic2Sw="
+URL_BASE = "https://openapi.koreainvestment.com:9443"
 
-# --- 암호화폐 데이터 ---
-@st.cache_data(ttl=30)
-def get_crypto_data():
-    try:
-        m_url = "https://api.upbit.com/v1/market/all"
-        m_data = requests.get(m_url, timeout=5).json()
-        krw_markets = {d['market']: d['korean_name'] for d in m_data if d['market'].startswith("KRW-")}
-        t_url = f"https://api.upbit.com/v1/ticker?markets={','.join(krw_markets.keys())}"
-        t_data = requests.get(t_url, timeout=5).json()
-        res = []
-        for d in t_data:
-            res.append({'코인명': krw_markets[d['market']], '현재가': d['trade_price'], '전일대비': d['signed_change_rate'] * 100, '거래대금': d['acc_trade_price_24h']})
-        df = pd.DataFrame(res).sort_values(by='거래대금', ascending=False).head(20)
-        df.insert(0, 'No', range(1, len(df) + 1))
-        return df
-    except: return pd.DataFrame()
+# --- 🔐 [인증] 토큰 발급 (캐싱 처리로 효율화) ---
+@st.cache_data(ttl=3600*12)
+def get_token():
+    url = f"{URL_BASE}/oauth2/tokenP"
+    body = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
+    res = requests.post(url, data=json.dumps(body))
+    return res.json().get('access_token')
 
-# --- 주식 데이터 및 분석 로직 ---
-@st.cache_data(ttl=600, show_spinner=False)
-def get_data(mode, date_s, market):
-    try:
-        # [보정] 입력된 날짜에 데이터가 있는지 확인하고, 없으면 최근 영업일로 변경
-        df_today = stock.get_market_ohlcv_by_ticker(date_s, market=market)
-        
-        if df_today.empty or df_today['거래대금'].sum() == 0:
-            date_s = stock.get_nearest_business_day_in_a_week()
-            df_today = stock.get_market_ohlcv_by_ticker(date_s, market=market)
-        
-        if df_today.empty: return pd.DataFrame()
+# --- 📊 [데이터] API 호출 공통 함수 ---
+def fetch_kis(path, tr_id, params):
+    token = get_token()
+    headers = {
+        "Content-Type": "application/json", "authorization": f"Bearer {token}",
+        "appkey": APP_KEY, "appsecret": APP_SECRET, "tr_id": tr_id, "custtype": "P"
+    }
+    res = requests.get(f"{URL_BASE}{path}", headers=headers, params=params)
+    return res.json() if res.status_code == 200 else None
 
-        df_cap = stock.get_market_cap_by_ticker(date_s, market=market)
-        
-        # 최근 60일간의 데이터를 가져와서 실제 영업일 리스트(days) 확보
-        start_search = (datetime.strptime(date_s, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
-        ohlcv_sample = stock.get_market_ohlcv_by_date(start_search, date_s, "005930")
-        
-        if ohlcv_sample.empty: return pd.DataFrame()
-        days = ohlcv_sample.index.strftime("%Y%m%d").tolist()
+# --- 🛠️ [핵심 로직] 조건별 종목 스캔 ---
+def get_analyzed_data(mode, mkt_code):
+    # 1단계: 실시간 거래대금 상위 100개 추출 (모든 분석의 모수)
+    p = {
+        "FID_COND_MRKT_DIV_CODE": "J", "FID_COND_SCR_DIV_CODE": "20171",
+        "FID_INPUT_ISCD": mkt_code, "FID_DIV_CLS_CODE": "0", "FID_BLNG_CLS_CODE": "0",
+        "FID_TRGT_CLS_CODE": "0", "FID_TRGT_EXLS_CLS_CODE": "0", "FID_INPUT_PRICE_1": "0",
+        "FID_INPUT_PRICE_2": "0", "FID_VOL_CNT": "0"
+    }
+    raw = fetch_kis("/uapi/domestic-stock/v1/ranking/trade-value", "FHPST01710000", p)
+    if not raw or 'output' not in raw: return pd.DataFrame()
+    df_top = pd.DataFrame(raw['output'])
 
-        # 1. 연속 거래대금 (누적 변동 로직)
-        if "연속 거래대금" in mode:
-            n = 3 if "3일" in mode else 5
-            if len(days) < n: return pd.DataFrame()
+    if mode == "거래대금 상위":
+        return df_top.head(50)
+
+    # 2단계: 개별 종목 일봉 데이터를 가져와서 조건 검증 (노가다 분석)
+    res = []
+    # API 부하와 속도를 고려하여 상위 30개만 정밀 스캔
+    scan_target = df_top.head(30)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, (_, row) in enumerate(scan_target.iterrows()):
+        ticker = row['mksc_shrn_iscd']
+        name = row['hts_kor_isnm']
+        status_text.text(f"🔍 분석 중: {name} ({i+1}/{len(scan_target)})")
+        progress_bar.progress((i + 1) / len(scan_target))
+
+        # 종목별 일봉 데이터 요청
+        p_hist = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"}
+        hist = fetch_kis("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100", p_hist)
+        
+        if hist and 'output2' in hist:
+            days = hist['output2'] # 0번이 오늘, 1번이 어제...
+            if len(days) < 10: continue
+
+            # [3일/5일 연속 거래대금 500억 이상]
+            if "연속 거래대금" in mode:
+                n = 3 if "3일" in mode else 5
+                # 단위: API 데이터는 '원' 단위이므로 50,000,000,000 체크
+                if all(float(d['acml_tr_pbmn']) >= 50000000000 for d in days[:n]):
+                    res.append(row)
             
-            target_days = days[-n:]
-            valid_tickers = None
-            first_day_df = stock.get_market_ohlcv_by_ticker(target_days[0], market=market)
-            last_day_df = stock.get_market_ohlcv_by_ticker(target_days[-1], market=market)
-            total_amt_series = pd.Series(0, index=df_today.index)
+            # [고가놀이] 4일 전 15% 이상 급등 후 3일간 횡보
+            elif mode == "고가놀이":
+                base_day = days[3] # 4일 전 (오늘이 0일차)
+                if float(base_day['prdy_ctrt']) >= 15:
+                    recent_3_avg = sum(float(d['prdy_ctrt']) for d in days[:3]) / 3
+                    if -5 <= recent_3_avg <= 5: res.append(row)
 
-            for d in target_days:
-                df_day = stock.get_market_ohlcv_by_ticker(d, market=market)
-                # 거래대금 기준 1,000억 이상 종목 추출
-                cond_1000b = df_day[df_day['거래대금'] >= 100000000000].index
-                valid_tickers = set(cond_1000b) if valid_tickers is None else valid_tickers.intersection(set(cond_1000b))
-                total_amt_series += df_day['거래대금']
-            
-            if not valid_tickers: return pd.DataFrame()
-            
-            res = []
-            for t in list(valid_tickers):
-                if t in first_day_df.index and t in last_day_df.index:
-                    f_close, l_close = first_day_df.loc[t, '종가'], last_day_df.loc[t, '종가']
-                    accum_rate = ((l_close - f_close) / f_close) * 100
-                    res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': accum_rate, '대금_v': total_amt_series.loc[t] / n})
-            return pd.DataFrame(res)
+            # [역헤드앤숄더] 저점 패턴 분석
+            elif mode == "역헤드앤숄더":
+                l1 = min(float(d['stck_clpr']) for d in days[14:21]) # 왼쪽 어깨
+                l2 = min(float(d['stck_clpr']) for d in days[7:14])  # 머리 (더 낮아야 함)
+                l3 = min(float(d['stck_clpr']) for d in days[:7])   # 오른쪽 어깨
+                if l2 < l1 and l2 < l3: res.append(row)
 
-        # 2. 고가놀이 (500억/15% 이후 3일 횡보)
-        elif mode == "고가놀이":
-            if len(days) < 4: return pd.DataFrame()
-            base_date = days[-4]
-            df_base = stock.get_market_ohlcv_by_ticker(base_date, market=market)
-            targets = df_base[(df_base['거래대금'] >= 50000000000) & (df_base['등락률'] >= 15)].index
-            res = []
-            for t in targets:
-                try:
-                    # 최근 3일간의 등락률 합계의 평균이 5% 이내인지 확인 (횡보)
-                    rates = [stock.get_market_ohlcv_by_ticker(d, market=market).loc[t, '등락률'] for d in days[-3:]]
-                    if abs(sum(rates) / 3) <= 5:
-                        res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
-                except: continue
-            return pd.DataFrame(res)
+        time.sleep(0.05) # TPS 제한(20회/초) 준수
 
-        elif mode == "역헤드앤숄더":
-            df_top = df_today.sort_values(by='거래대금', ascending=False).head(100)
-            res = []
-            for t in df_top.index:
-                try:
-                    df_hist = stock.get_market_ohlcv_by_date(days[-30], date_s, t)['종가']
-                    p1, p2, p3 = df_hist[:10], df_hist[10:20], df_hist[20:]
-                    l1, l2, l3 = p1.min(), p2.min(), p3.min()
-                    if l2 < l1 and l2 < l3 and l3 <= df_hist.iloc[-1] <= l3 * 1.07:
-                        res.append({'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df_today.loc[t, '등락률'], '대금_v': df_today.loc[t, '거래대금']})
-                except: continue
-            return pd.DataFrame(res)
+    progress_bar.empty()
+    status_text.empty()
+    return pd.DataFrame(res)
 
-        elif mode in ["상한가", "하한가"]:
-            cond = (df_today['등락률'] >= 29.5) if mode == "상한가" else (df_today['등락률'] <= -29.5)
-            limit_df = df_today[cond]
-            res = [{'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': limit_df.loc[t, '등락률'], '대금_v': limit_df.loc[t, '거래대금']} for t in limit_df.index]
-            return pd.DataFrame(res)
-        
-        else: # 거래대금 상위
-            df = df_today.sort_values(by='거래대금', ascending=False).head(50)
-            res = [{'기업명': stock.get_market_ticker_name(t), '시총_v': df_cap.loc[t, '시가총액'], '등락률': df.loc[t, '등락률'], '대금_v': df.loc[t, '거래대금']} for t in df.index]
-            return pd.DataFrame(res)
-    except Exception as e:
-        print(f"Error: {e}")
-        return pd.DataFrame()
+# --- 📱 메인 UI ---
+st.title("Stock Analysis 📈")
 
-# --- 앱 메인 UI ---
-st.title("Stock📈")
+mode = st.selectbox("분석 모드 선택", 
+    ["거래대금 상위", "3일 연속 거래대금", "5일 연속 거래대금", "고가놀이", "역헤드앤숄더", "암호화폐"])
 
-try:
-    init_date_str = stock.get_nearest_business_day_in_a_week()
-    default_d = datetime.strptime(init_date_str, "%Y%m%d")
-except:
-    default_d = datetime.now()
-
-col1, col2 = st.columns([1, 1.2])
-with col1:
-    d_input = st.date_input("날짜", default_d)
-    date_s = d_input.strftime("%Y%m%d")
-with col2:
-    mode = st.selectbox("분석 모드", ["거래대금 상위", "3일 연속 거래대금", "5일 연속 거래대금", "상한가", "하한가", "고가놀이", "역헤드앤숄더", "암호화폐"])
+mkt = st.radio("시장 선택", ["KOSPI", "KOSDAQ"], horizontal=True)
+mkt_id = "0001" if mkt == "KOSPI" else "1001"
 
 st.divider()
 
-if mode == "암호화폐":
-    with st.spinner("코인 시세를 불러오는 중..."):
-        data = get_crypto_data()
-    if not data.empty:
-        data['현재가'] = data['현재가'].apply(lambda x: f"{x:,.0f}" if x >= 100 else f"{x:,.2f}")
-        data['거래대금'] = data['거래대금'].apply(format_korean_unit)
-        st.dataframe(data.style.map(lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), subset=['전일대비']).format({'전일대비': '{:.1f}%'}), use_container_width=True, height=750, hide_index=True)
-else:
-    t1, t2 = st.tabs(["KOSPI", "KOSDAQ"])
-    for tab, mkt in zip([t1, t2], ["KOSPI", "KOSDAQ"]):
-        with tab:
-            with st.spinner(f"{mkt} 데이터를 불러오는 중..."):
-                data = get_data(mode, date_s, mkt)
+if st.button("🚀 분석 시작"):
+    if mode == "암호화폐":
+        with st.spinner("업비트 시세 로드 중..."):
+            res = requests.get("https://api.upbit.com/v1/ticker?markets=KRW-BTC,KRW-ETH,KRW-SOL,KRW-XRP,KRW-DOGE").json()
+            st.dataframe(pd.DataFrame(res), use_container_width=True)
+    else:
+        with st.spinner(f"{mkt} 데이터를 분석하고 있습니다. 잠시만 기다려주세요..."):
+            final_df = get_analyzed_data(mode, mkt_id)
             
-            if data is None or data.empty:
-                st.info("조건에 맞는 종목이 없거나 데이터를 불러올 수 없습니다. (주말/서버점검)")
-            else:
-                data = data.sort_values(by='대금_v', ascending=False)
-                data.insert(0, 'No', range(1, len(data) + 1))
-                data['시총'] = data['시총_v'].apply(format_korean_unit)
-                data['대금'] = data['대금_v'].apply(format_korean_unit)
+            if not final_df.empty:
+                # 결과 가공
+                out = final_df[['hts_kor_isnm', 'stck_prpr', 'prdy_ctrt', 'acml_tr_pbmn']].copy()
+                out.columns = ['종목명', '현재가', '등락률', '거래대금(억)']
+                out['거래대금(억)'] = out['거래대금(억)'].apply(lambda x: f"{int(float(x)//100000000):,}억")
                 
-                if "3일 연속" in mode: l_rate, l_amt = "3일 누적 변동", "3일 평균 대금"
-                elif "5일 연속" in mode: l_rate, l_amt = "5일 누적 변동", "5일 평균 대금"
-                else: l_rate, l_amt = "등락률", "거래대금"
-                
+                # 색상 입히기 (등락률 기준)
+                def color_rate(val):
+                    color = '#ef5350' if float(val) > 0 else ('#42a5f5' if float(val) < 0 else 'white')
+                    return f'color: {color}'
+
                 st.dataframe(
-                    data[['No', '기업명', '시총', '등락률', '대금']].rename(columns={'등락률': l_rate, '대금': l_amt}).style.map(
-                        lambda x: 'color: #ef5350;' if (isinstance(x, (int, float)) and x > 0) else ('color: #42a5f5;' if (isinstance(x, (int, float)) and x < 0) else ''), subset=[l_rate]
-                    ).format({l_rate: '{:.1f}%'}),
-                    use_container_width=True, height=600, hide_index=True
+                    out.style.map(color_rate, subset=['등락률']),
+                    use_container_width=True, hide_index=True, height=600
                 )
+            else:
+                st.info("검색 결과가 없습니다. 조건을 충족하는 종목이 현재 시장에 없습니다.")
+
+st.caption("※ 본 데이터는 한국투자증권 공식 API를 통해 실시간으로 분석됩니다.")
