@@ -1,5 +1,4 @@
-streamlit
-pykrx
 pandas
-setuptools
-xlsxwriter
+requests
+lxml
+html5lib
