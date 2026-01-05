@@ -1,43 +1,56 @@
 from pykrx import stock
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
-def get_top_50_by_amount(market_name):
-    # 1. 오늘 날짜 확인 (YYYYMMDD 형식)
-    # 장 중이거나 휴일일 경우 데이터가 없을 수 있으므로 최근 영업일 데이터를 가져옵니다.
-    today = datetime.now().strftime("%Y%m%d")
-    
-    print(f"[{market_name}] 데이터를 불러오는 중...")
-    
-    # 2. 지정한 시장의 전종목 시세 정보 가져오기 (종가, 대비, 등락률, 거래량, 거래대금 등)
-    df = stock.get_market_ohlcv_by_ticker(today, market=market_name)
-    
-    # 3. 종목명 추가 (티커만으로는 알기 어렵기 때문)
-    # 데이터프레임의 인덱스(티커)를 기준으로 종목명을 매핑합니다.
-    df['종목명'] = [stock.get_market_ticker_name(ticker) for ticker in df.index]
-    
-    # 4. 거래대금(Amount) 기준 내림차순 정렬 후 상위 50개 추출
-    # pykrx의 '거래대금' 단위는 '원'입니다.
-    top_50 = df.sort_values(by='거래대금', ascending=False).head(50)
-    
-    # 5. 보기 좋게 열 순서 변경 및 거래대금 단위 변경 (억원 단위)
-    top_50['거래대금(억원)'] = (top_50['거래대금'] / 100_000_000).round(1)
-    result = top_50[['종목명', '종가', '등락률', '거래대금(억원)']]
-    
-    return result
+def get_valid_date():
+    # 데이터가 있을 때까지 하루씩 뒤로 가며 영업일을 찾습니다.
+    target_date = datetime.now()
+    for _ in range(10):  # 최대 10일 전까지 탐색
+        date_str = target_date.strftime("%Y%m%d")
+        # 해당 날짜에 코스피 종목 리스트가 있는지 확인
+        tickers = stock.get_market_ticker_list(date_str, market="KOSPI")
+        if len(tickers) > 0:
+            return date_str
+        target_date -= timedelta(days=1)
+    return datetime.now().strftime("%Y%m%d")
 
-# 실행
-if __name__ == "__main__":
-    try:
-        # 코스피 상위 50
-        kospi_50 = get_top_50_by_amount("KOSPI")
-        print("\n--- KOSPI 거래대금 상위 50 ---")
-        print(kospi_50)
+def save_market_data():
+    search_date = get_valid_date()
+    print(f"[{search_date}] 기준 데이터를 수집합니다...")
 
-        # 코스닥 상위 50
-        kosdaq_50 = get_top_50_by_amount("KOSDAQ")
-        print("\n--- KOSDAQ 거래대금 상위 50 ---")
-        print(kosdaq_50)
+    markets = ["KOSPI", "KOSDAQ"]
+    writer = pd.ExcelWriter(f'주식_거래대금_순위_{search_date}.xlsx', engine='xlsxwriter')
+
+    for mnt in markets:
+        # 데이터 가져오기
+        df = stock.get_market_ohlcv_by_ticker(search_date, market=mnt)
         
-    except Exception as e:
-        print(f"에러 발생: {e}. 장 마감 직후나 서버 점검 시간에는 데이터를 불러오지 못할 수 있습니다.")
+        if df.empty:
+            print(f"{mnt} 데이터를 가져오지 못했습니다.")
+            continue
+
+        # 종목명 매핑
+        df['종목명'] = [stock.get_market_ticker_name(ticker) for ticker in df.index]
+        
+        # 거래대금 상위 50위 정렬
+        df = df.sort_values(by='거래대금', ascending=False).head(50)
+        
+        # 보기 좋게 가공
+        df['거래대금(억원)'] = (df['거래대금'] / 100_000_000).astype(int)
+        df['등락률'] = df['등락률'].round(2)
+        
+        # 필요한 컬럼만 선택
+        result = df[['종목명', '종가', '등락률', '거래대금(억원)']]
+        
+        # 터미널 화면에 출력
+        print(f"\n--- {mnt} 상위 50위 ---")
+        print(result)
+        
+        # 엑셀 시트로 저장
+        result.to_excel(writer, sheet_name=mnt)
+
+    writer.close()
+    print(f"\n✅ 파일 저장 완료: 주식_거래대금_순위_{search_date}.xlsx")
+
+if __name__ == "__main__":
+    save_market_data()
