@@ -1,96 +1,127 @@
 import streamlit as st
 import pandas as pd
 import requests
+import json
 import time
+from datetime import datetime
 
-# --- 1. 네이버 금융 데이터 추출 함수 ---
-def get_naver_top_list(market_code):
-    """거래대금 상위 종목 리스트 가져오기"""
-    url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={market_code}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    res = requests.get(url, headers=headers)
-    df = pd.read_html(res.text, encoding='cp949')[1]
-    return df.dropna(subset=['종목명'])
+# 1. 인증 정보 (사용자님 키)
+APP_KEY = "PSmBdpWduaskTXxqbcT6PuBTneKitnWiXnrL"
+APP_SECRET = "adyZ3eYxXM74UlaErGZWe1SEJ9RPNo2wOD/mDWkJqkKfB0re+zVtKNiZM5loyVumtm5It+jTdgplqbimwqnyboerycmQWrlgA/Uwm8u4K66LB6+PhIoO6kf8zS196RO570kjshkBBecQzUUfwLlDWBIlTu/Mvu4qYYi5dstnsjgZh3Ic2Sw="
+URL_BASE = "https://openapi.koreainvestment.com:9443"
 
-def get_item_daily_history(item_code, pages=1):
-    """특정 종목의 과거 일봉 데이터(거래대금, 등락률) 가져오기"""
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    all_days = []
-    for p in range(1, pages + 1):
-        url = f"https://finance.naver.com/item/sise_day.naver?code={item_code}&page={p}"
-        res = requests.get(url, headers=headers)
-        df = pd.read_html(res.text, header=0)[0].dropna()
-        all_days.append(df)
-    return pd.concat(all_days).reset_index(drop=True)
+@st.cache_data(ttl=3600)
+def get_token():
+    url = f"{URL_BASE}/oauth2/tokenP"
+    body = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
+    res = requests.post(url, data=json.dumps(body))
+    return res.json().get('access_token')
 
-# --- 2. 분석 메인 로직 ---
-def analyze_naver_stocks(mode, market_code):
-    top_df = get_naver_top_list(market_code)
-    # 종목 코드 추출 (네이버 리스트 페이지에는 코드가 없으므로 별도 처리나 상위 30개 집중 분석)
-    # 실제 운영시에는 종목명-코드 매핑 테이블이 필요하지만, 
-    # 여기서는 '상위 20개' 종목의 상세 페이지를 순회하며 검증합니다.
+def fetch_kis(path, tr_id, params):
+    headers = {
+        "Content-Type": "application/json", "authorization": f"Bearer {get_token()}",
+        "appkey": APP_KEY, "appsecret": APP_SECRET, "tr_id": tr_id, "custtype": "P"
+    }
+    res = requests.get(f"{URL_BASE}{path}", headers=headers, params=params)
+    return res.json()
+
+# 2. 핵심 분석 함수
+def get_analyzed_data(mode, mkt_id):
+    # [Step 1] 실시간 거래대금 상위 50개 가져오기 (이미 거래대금순으로 정렬되어 옴)
+    p = {
+        "FID_COND_MRKT_DIV_CODE": "J", "FID_COND_SCR_DIV_CODE": "20171",
+        "FID_INPUT_ISCD": mkt_id, "FID_DIV_CLS_CODE": "0", "FID_BLNG_CLS_CODE": "0",
+        "FID_TRGT_CLS_CODE": "0", "FID_TRGT_EXLS_CLS_CODE": "0", "FID_INPUT_PRICE_1": "0",
+        "FID_INPUT_PRICE_2": "0", "FID_VOL_CNT": "0"
+    }
+    raw = fetch_kis("/uapi/domestic-stock/v1/ranking/trade-value", "FHPST01710000", p)
+    if not raw or 'output' not in raw: return pd.DataFrame()
     
+    top_items = raw['output']
     results = []
-    scan_limit = 20 # 속도를 위해 상위 20개 종목 집중 분석
+    
     prog = st.progress(0)
     status = st.empty()
 
-    for i, row in enumerate(top_df.head(scan_limit).itertuples()):
-        prog.progress((i+1)/scan_limit)
-        # 네이버 리스트에서 종목 코드를 가져오기 위해 '종목명' 링크 대신 
-        # API나 특정 패턴으로 코드를 확보해야 함 (이 예제에서는 가상의 code_map 활용 가능)
-        # 테스트를 위해 거래대금 상위 종목의 이름만으로 분석 대상을 선정합니다.
-        
-        # ※ 주의: 네이버 리스트 페이지에는 종목코드가 노출되지 않아 
-        # 실제 구현시에는 종목마스터 데이터가 필요합니다. 
-        # 여기서는 로직 구조를 보여드립니다.
-        
-        name = row.종목명
-        status.text(f"🔍 '{name}' 조건 검증 중...")
-        
-        # 현재가 및 거래대금(백만 단위)
-        curr_price = float(str(row.현재가).replace(',', ''))
-        curr_rate = float(str(row.등락률).replace('%', '').replace('+', ''))
-        curr_amt = float(str(row.거래대금).replace(',', '')) * 1000000 # 원 단위 환산
-        
-        if mode == "거래대금 상위":
-            results.append({'종목명': name, '현재가': curr_price, '등락률': curr_rate, '거래대금': curr_amt})
-            
-        elif "연속 거래대금" in mode:
-            # 기준: 최근 n일 연속 거래대금 500억 이상
-            n = 3 if "3일" in mode else 5
-            if curr_amt >= 50000000000: # 일단 오늘 기준 통과 시 추가 검증
-                 results.append({'종목명': name, '현재가': curr_price, '등락률': curr_rate, '거래대금': curr_amt})
+    # 상위 30개 종목에 대해 조건 검증 (거래대금 순서 유지)
+    for i, item in enumerate(top_items[:30]):
+        ticker = item['mksc_shrn_iscd']
+        name = item['hts_kor_isnm']
+        status.text(f"🔍 '{name}' 조건 분석 중... ({i+1}/30)")
+        prog.progress((i+1)/30)
 
-        elif mode == "고가놀이":
-            # 기준: 오늘 등락률이 크지 않고 거래대금이 터진 종목
-            if abs(curr_rate) <= 5 and curr_amt >= 50000000000:
-                results.append({'종목명': name, '현재가': curr_price, '등락률': curr_rate, '거래대금': curr_amt})
+        # 종목별 최근 일봉 데이터(10일치) 가져오기
+        p_hist = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"}
+        hist = fetch_kis("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100", p_hist)
         
-        time.sleep(0.1) # 과부하 방지
+        if hist and 'output2' in hist:
+            days = hist['output2'] # 0번이 오늘, 1번이 어제...
+            
+            # 데이터 추출
+            today_amt = float(days[0]['acml_tr_pbmn'])
+            today_rate = float(days[0]['prdy_ctrt'])
+            
+            is_match = False
+            
+            if mode == "거래대금 상위":
+                is_match = True
+            
+            elif "연속 거래대금" in mode:
+                n = 3 if "3일" in mode else 5
+                # 기준 완화: 연속 n일 동안 거래대금이 300억 이상인지 체크
+                if len(days) >= n:
+                    check = [float(days[j]['acml_tr_pbmn']) >= 30000000000 for j in range(n)]
+                    if all(check): is_match = True
+            
+            elif mode == "고가놀이":
+                # 기준: 4일 전 15% 이상 급등 후, 최근 3일간 종가가 -5% ~ +5% 내에서 횡보
+                if len(days) >= 4:
+                    big_up = float(days[3]['prdy_ctrt']) >= 15
+                    avg_move = sum(float(days[j]['prdy_ctrt']) for j in range(3)) / 3
+                    if big_up and abs(avg_move) <= 5: is_match = True
+
+            if is_match:
+                results.append({
+                    "종목명": name,
+                    "현재가": f"{int(float(days[0]['stck_clpr'])):,}원",
+                    "등락률": today_rate,
+                    "거래대금": today_amt,
+                    "순위": int(item['data_rank'])
+                })
+        
+        time.sleep(0.05) # API 제한 준수
 
     prog.empty()
     status.empty()
-    return pd.DataFrame(results)
+    
+    # 결과가 있으면 거래대금(또는 원래 순위) 순으로 정렬하여 반환
+    res_df = pd.DataFrame(results)
+    if not res_df.empty:
+        return res_df.sort_values(by="거래대금", ascending=False)
+    return res_df
 
-# --- 3. Streamlit UI ---
-st.title("해민증권🧑‍💼 (Naver Full)")
+# 3. UI 구성
+st.title("📈 해민증권 실시간 분석")
 
-mode = st.selectbox("분석 모드", ["거래대금 상위", "3일 연속 거래대금", "5일 연속 거래대금", "고가놀이"])
-mkt_name = st.radio("시장", ["KOSPI", "KOSDAQ"], horizontal=True)
-mkt_code = 0 if mkt_name == "KOSPI" else 1
+mode = st.selectbox("분석 조건 선택", ["거래대금 상위", "3일 연속 거래대금", "5일 연속 거래대금", "고가놀이"])
+mkt = st.radio("시장 선택", ["KOSPI", "KOSDAQ"], horizontal=True)
+mkt_id = "0001" if mkt == "KOSPI" else "1001"
 
-if st.button("분석 시작"):
-    with st.spinner("데이터 분석 중..."):
-        df = analyze_naver_stocks(mode, mkt_code)
+if st.button("🚀 조건 검색 시작"):
+    with st.spinner("한국투자증권 API 정밀 분석 중..."):
+        df = get_analyzed_data(mode, mkt_id)
         
         if not df.empty:
+            # 출력용 가공
             df['거래대금(억)'] = df['거래대금'].apply(lambda x: f"{int(x//100000000):,}억")
+            
+            st.success(f"조건에 맞는 종목 {len(df)}개를 찾았습니다 (거래대금 순 정렬)")
             st.dataframe(
                 df[['종목명', '현재가', '등락률', '거래대금(억)']].style.map(
-                    lambda x: 'color: #ef5350;' if x > 0 else 'color: #42a5f5;', subset=['등락률']
-                ).format({'현재가': '{:,.0f}원', '등락률': '{:.2f}%'}),
-                use_container_width=True, hide_index=True
+                    lambda x: 'color: #ef5350;' if x > 0 else ('color: #42a5f5;' if x < 0 else ''), 
+                    subset=['등락률']
+                ).format({'등락률': '{:.2f}%'}),
+                use_container_width=True, hide_index=True, height=600
             )
         else:
-            st.info("조건에 맞는 종목이 없습니다.")
+            st.warning("조건에 맞는 종목이 없습니다. 기준을 더 낮추거나 시장을 변경해 보세요.")
