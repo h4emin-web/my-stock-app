@@ -1,132 +1,159 @@
-import requests
+import streamlit as st
+from pykrx import stock
 import pandas as pd
-import time
 from datetime import datetime, timedelta
 
-# --- [정보 설정] ---
-APP_KEY = "PSmBdpWduaskTXxqbcT6PuBTneKitnWiXnrL"
-APP_SECRET = "adyZ3eYxXM74UlaErGZWe1SEJ9RPNo2wOD/mDWkJqkKfB0re+zVtKNiZM5loyVumtm5It+jTdgplqbimwqnyboerycmQWrlgA/Uwm8u4K66LB6+PhIoO6kf8zS196RO570kjshkBBecQzUUfwLlDWBIlTu/Mvu4qYYi5dstnsjgZh3Ic2Sw="
-URL_BASE = "https://openapi.koreainvestment.com:9443"
+# 1. 페이지 설정
+st.set_page_config(page_title="주식 분석기 PRO", layout="wide")
 
-def get_access_token():
-    """접근 토큰 발급"""
-    url = f"{URL_BASE}/oauth2/tokenP"
-    payload = {"grant_type": "client_credentials", "appkey": APP_KEY, "secretkey": APP_SECRET}
-    res = requests.post(url, json=payload)
-    if res.status_code == 200:
-        return res.json().get('access_token')
-    else:
-        print("토큰 발급 실패:", res.json())
-        return None
+# --- 유틸리티 함수 ---
+def format_korean_unit(val):
+    if pd.isna(val) or val == 0: return "0원"
+    if val >= 1000000000000:
+        cho, uk = val // 1000000000000, (val % 1000000000000) // 100000000
+        return f"{int(cho):,}조 {int(uk):,}억" if uk > 0 else f"{int(cho):,}조"
+    return f"{int(val // 100000000):,}억"
 
-def get_stock_list(token):
-    """1. 거래대금 순위 상위 100종목 조회"""
-    path = "/uapi/domestic-stock/v1/ranking/trade-value"
-    headers = {
-        "Content-Type": "application/json",
-        "authorization": f"Bearer {token}",
-        "appkey": APP_KEY, "appsecret": APP_SECRET,
-        "tr_id": "FHPST01710000"
-    }
-    params = {
-        "fid_cond_scr_div_code": "20171",
-        "fid_cond_rank_sort_code": "0",
-        "fid_input_cntstr_000": "",
-        "fid_input_iscd_000": "0000"
-    }
-    res = requests.get(f"{URL_BASE}{path}", headers=headers, params=params)
-    return res.json().get('output', [])
-
-def get_daily_ohlcv(code, target_date, token):
-    """2. 종목별 일자별 시세 조회"""
-    path = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
-    headers = {
-        "authorization": f"Bearer {token}",
-        "appkey": APP_KEY, "appsecret": APP_SECRET,
-        "tr_id": "FHKST03010100"
-    }
-    # 넉넉하게 최근 20일치 데이터를 가져옴
-    start_date = (datetime.strptime(target_date, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
-    params = {
-        "fid_cond_scr_div_code": "J",
-        "fid_input_iscd": code,
-        "fid_input_date_1": start_date,
-        "fid_input_date_2": target_date,
-        "fid_period_div_code": "D",
-        "fid_org_adj_prc": "1"
-    }
-    res = requests.get(f"{URL_BASE}{path}", headers=headers, params=params)
-    if res.status_code == 200:
-        df = pd.DataFrame(res.json().get('output2', []))
-        if df.empty: return None
-        # 데이터 정제 (최신순 -> 과거순 정렬)
-        df = df[['stck_clpr', 'stck_hgpr', 'stck_lwpr', 'acml_tr_pbmn', 'prdy_ctrt']].apply(pd.to_numeric)
-        return df.iloc[::-1].reset_index(drop=True) # 과거부터 현재 순으로 정렬
-    return None
-
-# --- [메인 로직] ---
-def run_scanner(target_date_str):
-    token = get_access_token()
-    if not token: return
-    
-    print(f"🚀 {target_date_str} 기준 분석 시작 (약 1~2분 소요)...")
-    top_100 = get_stock_list(token)
-    
-    final_list = []
-    
-    for i, stock in enumerate(top_100):
-        code = stock['mksc_shrn_iscd']
-        name = stock['hts_kor_isnm']
+# --- [신규] 고가놀이 종목 발굴 함수 ---
+@st.cache_data(ttl=600)
+def find_high_tight_flag(date_str, market):
+    try:
+        # 1. 영업일 리스트 확보 (최근 10일치)
+        start_search = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=15)).strftime("%Y%m%d")
+        ohlcv_days = stock.get_market_ohlcv_by_date(start_search, date_str, "005930")
+        days = ohlcv_days.index.strftime("%Y%m%d").tolist()
         
-        # API 과부하 방지 (초당 호출 제한 준수)
-        time.sleep(0.15) 
+        if len(days) < 4: return pd.DataFrame()
         
-        df = get_daily_ohlcv(code, target_date_str, token)
-        if df is None or len(df) < 10: continue
+        # 분석 대상일 설정
+        target_day = days[-1]   # 오늘(기준일)
+        prev_1 = days[-2]       # 1일 전
+        prev_2 = days[-3]       # 2일 전
+        base_day = days[-4]     # 3일 전 (장대양봉 기준일)
         
-        # --- 조건 계산 ---
-        # A. 거래대금 조건 (단위: 원 -> 1000억 이상 체크)
-        avg_val_3 = df['acml_tr_pbmn'].iloc[-3:].mean()
-        avg_val_5 = df['acml_tr_pbmn'].iloc[-5:].mean()
-        is_high_volume = (avg_val_3 >= 100_000_000_000) or (avg_val_5 >= 100_000_000_000)
+        # 2. 기준일(3일 전) 데이터: 거래대금 500억 이상 & 15% 이상 상승
+        base_df = stock.get_market_ohlcv_by_ticker(base_day, market=market)
+        condition_stocks = base_df[(base_df['거래대금'] >= 50000000000) & (base_df['등락률'] >= 15)].index
         
-        # B. 고가놀이 패턴 조건
-        # 1) 기준봉(T-3 또는 T-4)에서 15% 이상 급등했는가?
-        spike_found = False
-        base_idx = -1
-        for idx in range(-5, -2): # 최근 3~5일 전 탐색
-            if df['prdy_ctrt'].iloc[idx] >= 15:
-                spike_found = True
-                base_idx = idx
-                break
+        if len(condition_stocks) == 0: return pd.DataFrame()
         
-        is_high_play = False
-        if spike_found:
-            base_price = df['stck_clpr'].iloc[base_idx]
-            # 기준봉 이후 현재까지 고가/저가가 기준봉 종가 대비 5% 내외 유지
-            post_days = df.iloc[base_idx+1:]
-            if not post_days.empty:
-                max_high = post_days['stck_hgpr'].max()
-                min_low = post_days['stck_lwpr'].min()
-                if (max_high <= base_price * 1.05) and (min_low >= base_price * 0.95):
-                    is_high_play = True
-
-        # --- 결과 취합 ---
-        if is_high_volume or is_high_play:
-            final_list.append({
-                "종목명": name,
-                "3일평균(억)": round(avg_val_3 / 1e8, 1),
-                "5일평균(억)": round(avg_val_5 / 1e8, 1),
-                "고가놀이": "✅" if is_high_play else "-"
-            })
+        # 3. 이후 3일간(prev_2, prev_1, target_day)의 데이터 추적
+        res = []
+        df_cap = stock.get_market_cap_by_ticker(target_day, market=market)
+        
+        for ticker in condition_stocks:
+            try:
+                # 3일간의 등락률 합산 평균 계산
+                r1 = stock.get_market_ohlcv_by_ticker(prev_2, market=market).loc[ticker, '등락률']
+                r2 = stock.get_market_ohlcv_by_ticker(prev_1, market=market).loc[ticker, '등락률']
+                r3 = base_df.loc[ticker, '등락률'] # 여기서는 기준일 이후의 흐름이므로 오늘 등락률 사용
+                r3_actual = stock.get_market_ohlcv_by_ticker(target_day, market=market).loc[ticker, '등락률']
+                
+                avg_rate = abs(r1 + r2 + r3_actual) / 3
+                
+                # 평균 등락률이 5% 이하인 종목 필터링
+                if avg_rate <= 5:
+                    res.append({
+                        '기업명': stock.get_market_ticker_name(ticker),
+                        '시가총액_v': df_cap.loc[ticker, '시가총액'] if ticker in df_cap.index else 0,
+                        '주가': stock.get_market_ohlcv_by_ticker(target_day, market=market).loc[ticker, '종가'],
+                        '등락률': r3_actual,
+                        '거래대금_v': stock.get_market_ohlcv_by_ticker(target_day, market=market).loc[ticker, '거래대금'],
+                        '패턴': '고가놀이'
+                    })
+            except: continue
             
-    # 결과 출력
-    result_df = pd.DataFrame(final_list)
-    if not result_df.empty:
-        print("\n=== 검색 결과 ===")
-        print(result_df)
-    else:
-        print("\n조건에 부합하는 종목이 없습니다.")
+        final_df = pd.DataFrame(res).sort_values(by='거래대금_v', ascending=False)
+        if not final_df.empty: final_df.insert(0, '순위', range(1, len(final_df) + 1))
+        return final_df
+    except: return pd.DataFrame()
 
-# 실행 (원하는 날짜 입력)
-run_scanner("20240522")
+# --- 기존 분석 함수 (생략/유지) ---
+@st.cache_data(ttl=600)
+def get_limit_price_stocks(date_str, market, limit_type="UP"):
+    # (이전 코드와 동일 - 시가총액 포함 버전)
+    try:
+        df = stock.get_market_ohlcv_by_ticker(date_str, market=market)
+        df_cap = stock.get_market_cap_by_ticker(date_str, market=market)
+        limit_df = df[df['등락률'] >= 29.5].copy() if limit_type == "UP" else df[df['등락률'] <= -29.5].copy()
+        res = []
+        for t in limit_df.index:
+            res.append({'기업명': stock.get_market_ticker_name(t), '시가총액_v': df_cap.loc[t, '시가총액'], '주가': limit_df.loc[t, '종가'], '등락률': limit_df.loc[t, '등락률'], '거래대금_v': limit_df.loc[t, '거래대금'], '연속 기록': '분석중'})
+        df_res = pd.DataFrame(res); df_res.insert(0, '순위', range(1, len(df_res)+1))
+        return df_res
+    except: return pd.DataFrame()
+
+@st.cache_data(ttl=600)
+def fetch_stock_data(date_str, market, n_days):
+    # (이전 코드와 동일)
+    df = stock.get_market_ohlcv_by_ticker(date_str, market=market)
+    df = df.sort_values(by='거래대금', ascending=False).head(100)
+    df_cap = stock.get_market_cap_by_ticker(date_str, market=market)
+    res = [{'기업명': stock.get_market_ticker_name(t), '시가총액_v': df_cap.loc[t, '시가총액'], '주가': df.loc[t, '종가'], '등락률': df.loc[t, '등락률'], '거래대금_v': df.loc[t, '거래대금']} for t in df.index]
+    df_res = pd.DataFrame(res); df_res.insert(0, '순위', range(1, len(df_res)+1))
+    return df_res
+
+# --- UI 설정 ---
+st.sidebar.title("🔍 검색 설정")
+try:
+    init_date = stock.get_nearest_business_day_in_a_week()
+    default_d = datetime.strptime(init_date, "%Y%m%d")
+except: default_d = datetime.now()
+
+selected_date = st.sidebar.date_input("조회 기준일", default_d)
+date_s = selected_date.strftime("%Y%m%d")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📅 거래대금 연속")
+cont_choice = st.sidebar.pills("연속 기간", options=["3일 연속", "5일 연속"], selection_mode="single", key="cont")
+
+st.sidebar.subheader("🚫 가격 제한폭 도달")
+limit_choice = st.sidebar.pills("제한폭", options=["상한가", "하한가"], selection_mode="single", key="limit")
+
+st.sidebar.subheader("🎯 종목 발굴")
+discovery_choice = st.sidebar.pills("패턴 선택", options=["고가놀이"], selection_mode="single", key="discovery")
+
+# 모드 결정 로직
+current_mode = "거래대금 상위"
+if st.session_state.discovery: current_mode = st.session_state.discovery
+elif st.session_state.limit: current_mode = st.session_state.limit
+elif st.session_state.cont: current_mode = st.session_state.cont
+
+# 메인 화면
+tab1, tab2 = st.tabs(["KOSPI", "KOSDAQ"])
+
+for tab, mkt in zip([tab1, tab2], ["KOSPI", "KOSDAQ"]):
+    with tab:
+        if current_mode == "고가놀이":
+            display_df = find_high_tight_flag(date_s, mkt)
+            title = f"🚩 {mkt} 고가놀이 패턴 (장대양봉 후 횡보)"
+        elif current_mode in ["상한가", "하한가"]:
+            display_df = get_limit_price_stocks(date_s, mkt, "UP" if current_mode=="상한가" else "DOWN")
+            title = f"🔥 {mkt} {current_mode}"
+        else:
+            n_days = 3 if current_mode == "3일 연속" else (5 if current_mode == "5일 연속" else 1)
+            display_df = fetch_stock_data(date_s, mkt, n_days)
+            title = f"📊 {mkt} {'상위 100' if current_mode == '거래대금 상위' else current_mode}"
+
+        if display_df.empty:
+            st.warning("조건에 부합하는 종목이 없습니다.")
+        else:
+            display_df['거래대금'] = display_df['거래대금_v'].apply(format_korean_unit)
+            display_df['시가총액'] = display_df['시가총액_v'].apply(format_korean_unit)
+            st.subheader(title)
+            
+            # PC 버전에 맞게 컬럼 너비 및 표시 최적화
+            st.dataframe(
+                display_df[['순위', '기업명', '시가총액', '주가', '등락률', '거래대금']].style.map(
+                    lambda x: 'color: #ef5350; font-weight: bold;' if x > 0 else ('color: #42a5f5; font-weight: bold;' if x < 0 else ''), subset=['등락률']
+                ).format({'등락률': '{:.2f}%', '주가': '{:,}원'}),
+                column_config={
+                    "순위": st.column_config.Column(width=60),
+                    "기업명": st.column_config.Column(width=200),
+                    "시가총액": st.column_config.Column(width=180),
+                    "주가": st.column_config.Column(width=120),
+                    "등락률": st.column_config.Column(width=100),
+                    "거래대금": st.column_config.Column(width=180),
+                },
+                use_container_width=False, height=750, hide_index=True
+            )
