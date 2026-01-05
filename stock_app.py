@@ -1,141 +1,123 @@
-import streamlit as st
-import pandas as pd
 import requests
-import json
+import pandas as pd
 import time
-from datetime import datetime, timedelta
 
-# --- 1. 앱 설정 ---
-st.set_page_config(page_title="KIS 주식/코인 분석기", layout="wide")
-
-# --- 2. 인증 정보 (제공해주신 키 사용) ---
+# --- [설정부] API 키 및 계정 정보 ---
 APP_KEY = "PSmBdpWduaskTXxqbcT6PuBTneKitnWiXnrL"
 APP_SECRET = "adyZ3eYxXM74UlaErGZWe1SEJ9RPNo2wOD/mDWkJqkKfB0re+zVtKNiZM5loyVumtm5It+jTdgplqbimwqnyboerycmQWrlgA/Uwm8u4K66LB6+PhIoO6kf8zS196RO570kjshkBBecQzUUfwLlDWBIlTu/Mvu4qYYi5dstnsjgZh3Ic2Sw="
-URL_BASE = "https://openapi.koreainvestment.com:9443"
+URL_BASE = "https://openapi.koreainvestment.com:9443" # 실전계좌 기준
 
-# --- 3. 핵심 함수 (토큰 및 API 호출) ---
-@st.cache_data(ttl=3600*12)
-def get_token():
-    try:
-        url = f"{URL_BASE}/oauth2/tokenP"
-        body = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
-        res = requests.post(url, data=json.dumps(body))
-        return res.json().get('access_token')
-    except:
-        return None
+def get_access_token():
+    """접근 토큰 발급"""
+    url = f"{URL_BASE}/oauth2/tokenP"
+    payload = {
+        "grant_type": "client_credentials",
+        "appkey": APP_KEY,
+        "secretkey": APP_SECRET
+    }
+    res = requests.post(url, json=payload)
+    return res.json()['access_token']
 
-def fetch_kis(path, tr_id, params):
-    token = get_token()
-    if not token: return None
+ACCESS_TOKEN = get_access_token()
+
+def get_top_100_by_value():
+    """1. 거래대금 상위 100종목 가져오기 (당일 기준)"""
+    path = "/uapi/domestic-stock/v1/ranking/trade-value"
     headers = {
-        "Content-Type": "application/json", "authorization": f"Bearer {token}",
-        "appkey": APP_KEY, "appsecret": APP_SECRET, "tr_id": tr_id, "custtype": "P"
+        "Content-Type": "application/json",
+        "authorization": f"Bearer {ACCESS_TOKEN}",
+        "appkey": APP_KEY,
+        "appsecret": APP_SECRET,
+        "tr_id": "FHPST01710000"
     }
-    try:
-        res = requests.get(f"{URL_BASE}{path}", headers=headers, params=params)
-        return res.json()
-    except:
-        return None
-
-# --- 4. 분석 로직 (날짜 매칭 및 조건 검사) ---
-def analyze_stocks(mkt_id, target_date, mode):
-    target_date_str = target_date.strftime("%Y%m%d")
-    
-    # [Step 1] 기준이 될 종목 리스트 가져오기 (거래대금 상위 30개)
-    p = {
-        "FID_COND_MRKT_DIV_CODE": "J", "FID_COND_SCR_DIV_CODE": "20171",
-        "FID_INPUT_ISCD": mkt_id, "FID_DIV_CLS_CODE": "0", "FID_BLNG_CLS_CODE": "0",
-        "FID_TRGT_CLS_CODE": "0", "FID_TRGT_EXLS_CLS_CODE": "0", "FID_INPUT_PRICE_1": "0",
-        "FID_INPUT_PRICE_2": "0", "FID_VOL_CNT": "0"
+    # FID_COND_SCR_DIV_CODE: 20171 (거래대금순위)
+    params = {
+        "fid_cond_scr_div_code": "20171",
+        "fid_cond_rank_sort_code": "0", # 전체
+        "fid_input_cntstr_000": "",
+        "fid_input_iscd_000": "0000" # 0000: 전체, 0001: 코스피, 1001: 코스닥
     }
-    raw_data = fetch_kis("/uapi/domestic-stock/v1/ranking/trade-value", "FHPST01710000", p)
+    res = requests.get(f"{URL_BASE}{path}", headers=headers, params=params)
+    return pd.DataFrame(res.json()['output'])
+
+def get_daily_price(code):
+    """특정 종목의 최근 일봉 데이터 조회"""
+    path = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    headers = {
+        "Content-Type": "application/json",
+        "authorization": f"Bearer {ACCESS_TOKEN}",
+        "appkey": APP_KEY,
+        "appsecret": APP_SECRET,
+        "tr_id": "FHKST03010100"
+    }
+    params = {
+        "fid_cond_scr_div_code": "J",
+        "fid_input_iscd": code,
+        "fid_input_date_1": "20230101", # 충분히 과거 날짜
+        "fid_input_date_2": "20231231", # 조회할 날짜
+        "fid_period_div_code": "D", # 일봉
+        "fid_org_adj_prc": "1"
+    }
+    res = requests.get(f"{URL_BASE}{path}", headers=headers, params=params)
+    df = pd.DataFrame(res.json()['output2'])
+    # 숫자형 변환
+    cols = ['stck_clpr', 'stck_hgpr', 'stck_lwpr', 'acml_tr_pbmn', 'prdy_ctrt']
+    df[cols] = df[cols].apply(pd.to_numeric)
+    return df
+
+# --- [로직부] 조건 검색 실행 ---
+def run_scanner():
+    print("거래대금 상위 100개 종목 분석 중...")
+    top_df = get_top_100_by_value()
     
-    if not raw_data or 'output' not in raw_data:
-        st.error("API로부터 종목 리스트를 불러오지 못했습니다.")
-        return pd.DataFrame()
+    final_candidates = []
 
-    items = raw_data['output']
-    results = []
-    
-    prog = st.progress(0)
-    status = st.empty()
-
-    for i, item in enumerate(items[:30]): # 상위 30개만 정밀 분석 (속도/제한 고려)
-        ticker = item['mksc_shrn_iscd']
-        name = item['hts_kor_isnm']
-        status.text(f"🔍 '{name}' 분석 중... ({i+1}/30)")
-        prog.progress((i+1)/30)
-
-        # [Step 2] 종목별 과거 일봉 데이터 조회
-        p_hist = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker, "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"}
-        hist = fetch_kis("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100", p_hist)
+    for idx, row in top_df.iterrows():
+        code = row['mksc_shrn_iscd']
+        name = row['hts_kor_isnm']
         
-        if hist and 'output2' in hist:
-            days = hist['output2']
-            # 선택한 날짜의 데이터 위치 찾기
-            idx = next((i for i, d in enumerate(days) if d['stck_bsop_date'] == target_date_str), None)
+        try:
+            # 일봉 데이터 가져오기 (API 호출 제한 방지를 위해 간격 조절)
+            df = get_daily_price(code)
+            time.sleep(0.2) 
             
-            if idx is not None:
-                d = days[idx]
-                curr_val = float(d['acml_tr_pbmn']) # 거래대금
-                curr_rate = float(d['prdy_ctrt'])   # 등락률
-                
-                match = False
-                if mode == "전체 보기":
-                    match = True
-                elif mode == "3일 연속 거래대금 500억↑":
-                    if len(days) >= idx + 3:
-                        check = [float(days[idx+j]['acml_tr_pbmn']) >= 50000000000 for j in range(3)]
-                        if all(check): match = True
-                elif mode == "고가놀이(급등 후 횡보)":
-                    if len(days) >= idx + 4:
-                        big_up = float(days[idx+3]['prdy_ctrt']) >= 15 # 4일전 급등
-                        side_move = abs(sum(float(days[idx+j]['prdy_ctrt']) for j in range(3))/3) <= 5
-                        if big_up and side_move: match = True
-                
-                if match:
-                    results.append({
-                        "종목명": name,
-                        "날짜": d['stck_bsop_date'],
-                        "종가": f"{int(d['stck_clpr']):,}원",
-                        "등락률": f"{curr_rate}%",
-                        "거래대금": f"{int(curr_val//100000000):,}억"
-                    })
-        
-        time.sleep(0.05) # 초당 호출 제한 준수
+            # 최근 5일치 데이터 (최근일이 0번 인덱스일 수 있으므로 정렬 확인 필요)
+            # 여기서는 최근일이 마지막 행이라고 가정(iloc)
+            
+            # 2. 거래대금 조건 (단위: 원, API 값은 보통 그대로 나옴)
+            avg_val_3 = df['acml_tr_pbmn'].iloc[-3:].mean()
+            avg_val_5 = df['acml_tr_pbmn'].iloc[-5:].mean()
+            
+            cond_val_3 = avg_val_3 >= 100_000_000_000
+            cond_val_5 = avg_val_5 >= 100_000_000_000
+            
+            # 3. 고가놀이 패턴 조건
+            # - 4일 전 혹은 3일 전에 15% 이상 상승 (기준봉)
+            # - 그 후 3일간 변동폭이 기준봉 종가 대비 5% 내외 유지
+            spike_row = df.iloc[-4] # 4일 전 기준봉 가정
+            is_spike = spike_row['prdy_ctrt'] >= 15
+            
+            # 기준봉 이후 고가와 저가가 기준봉 종가의 ±5% 이내인지 확인
+            post_spike_days = df.iloc[-3:]
+            max_high = post_spike_days['stck_hgpr'].max()
+            min_low = post_spike_days['stck_lwpr'].min()
+            base_price = spike_row['stck_clpr']
+            
+            is_high_tight = (max_high <= base_price * 1.05) and (min_low >= base_price * 0.95)
 
-    status.empty()
-    prog.empty()
-    return pd.DataFrame(results)
+            # 결과 저장
+            if cond_val_3 or cond_val_5 or (is_spike and is_high_tight):
+                final_candidates.append({
+                    "종목명": name,
+                    "3일평균대금": avg_val_3,
+                    "5일평균대금": avg_val_5,
+                    "고가놀이여부": "Y" if (is_spike and is_high_tight) else "N"
+                })
+        except:
+            continue
 
-# --- 5. 메인 화면 구성 ---
-st.title("📈 주식 & 코인 스마트 분석기")
+    return pd.DataFrame(final_candidates)
 
-with st.sidebar:
-    st.header("설정")
-    target_date = st.date_input("분석 기준 날짜", datetime.now())
-    mkt = st.radio("시장 선택", ["KOSPI", "KOSDAQ"])
-    mkt_id = "0001" if mkt == "KOSPI" else "1001"
-    mode = st.selectbox("분석 조건", ["전체 보기", "3일 연속 거래대금 500억↑", "고가놀이(급등 후 횡보)", "암호화폐(업비트)"])
-
-if st.button("분석 실행"):
-    if mode == "암호화폐(업비트)":
-        with st.spinner("코인 시세 조회 중..."):
-            coins = "KRW-BTC,KRW-ETH,KRW-SOL,KRW-XRP,KRW-DOGE"
-            res = requests.get(f"https://api.upbit.com/v1/ticker?markets={coins}").json()
-            c_df = pd.DataFrame(res)
-            c_df = c_df[['market', 'trade_price', 'signed_change_rate', 'acc_trade_price_24h']]
-            c_df.columns = ['코인', '현재가', '등락률', '24H 거래대금']
-            c_df['등락률'] = (c_df['등락률']*100).round(2).astype(str) + "%"
-            c_df['현재가'] = c_df['현재가'].apply(lambda x: f"{x:,.0f}원")
-            st.table(c_df)
-    else:
-        with st.spinner(f"{mkt} 시장 분석 중..."):
-            df = analyze_stocks(mkt_id, target_date, mode)
-            if not df.empty:
-                st.success(f"{len(df)}개의 종목을 찾았습니다.")
-                st.dataframe(df, use_container_width=True, hide_index=True)
-            else:
-                st.warning("조건에 맞는 종목이 없습니다. 날짜를 변경하거나 조건을 완화해보세요.")
-
-st.info("※ 한국투자증권 API 특성상 주말/공휴일은 데이터가 조회되지 않을 수 있습니다.")
+# 실행
+result = run_scanner()
+print(result)
